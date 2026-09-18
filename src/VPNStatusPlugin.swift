@@ -686,6 +686,12 @@ private enum Main {
                             reconnect()
                         } else {
                             logEvent("connect peek presented")
+                            // The peek update already carries the current country/flag
+                            // surfaces: sync the signatures or the country-refresh
+                            // branch will send a duplicate update in the same breath,
+                            // which cancels the just-started peek presentation.
+                            lastBaseSig = baseSig
+                            lastFullSig = sig
                         }
                     }
                 }
@@ -746,9 +752,12 @@ private enum Main {
                         }
                         lastBaseSig = baseSig
                         lastFullSig = sig
-                    } else if published, sig != lastFullSig {
+                    } else if published, pendingPeekAt == nil, sig != lastFullSig {
                         // Only the country flag changed: refresh the live activity
                         // in place instead of re-presenting the sneak peek.
+                        // Skipped while a connect peek is pending — the peek update
+                        // already delivers the flag, and a second update right then
+                        // would cancel the peek.
                         if sendTracked(
                             client,
                             peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
