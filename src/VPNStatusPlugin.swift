@@ -635,13 +635,13 @@ private enum Main {
 
                 if let peekAt = pendingPeekAt, now >= peekAt {
                     pendingPeekAt = nil
-                    if published, state.connected {
+                    if published {
                         // The capsule from the create is now established, so the
                         // peek update is honoured (same path as the disconnect peek).
                         if !sendTracked(
                             client,
-                            peekUpdatePayload(connected: true, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
-                            "connect peek"
+                        peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                        "post-create peek"
                         ) {
                             published = false
                             lastBaseSig = ""
