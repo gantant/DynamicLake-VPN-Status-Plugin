@@ -10,7 +10,7 @@ ZIP="../VPNStatus.dynamiclakeplugin.zip"
 SLICE_DIR=$(mktemp -d)
 trap 'rm -rf "$SLICE_DIR"' EXIT
 
-SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift VPNStatusPlugin.swift)
+SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift VPNStatusPlugin.swift)
 
 echo "==> Compiling arm64 slice"
 swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \
@@ -32,6 +32,7 @@ mkdir -p "$PKG"
 cp "$SLICE_DIR/vpn-status" "$PKG/vpn-status"
 cp plugin.json "$PKG/plugin.json"
 cp icon.png "$PKG/icon.png"
+cp -R flags "$PKG/flags"
 chmod +x "$PKG/vpn-status"
 cp "$SLICE_DIR/vpn-status" vpn-status   # keep the src copy of the build in sync
 rm -rf "$PKG.old"
