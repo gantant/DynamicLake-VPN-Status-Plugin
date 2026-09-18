@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "identifier": "com.nebulark.vpn-status",
+  "name": "VPN Status",
+  "version": "1.1.0",
+  "developerName": "Nebulark",
+  "description": "Shows VPN connection status in the notch.",
+  "executable": "vpn-status",
+  "arguments": [],
+  "icon": "icon.png",
+  "autoStart": true,
+  "settings": [
+    {
+      "id": "notifyOnChange",
+      "type": "switch",
+      "title": "Notify on Change",
+      "description": "When enabled, show a brief notification on connect/disconnect instead of a persistent live activity",
+      "systemImage": "bell.badge",
+      "tint": "blue",
+      "default": false
+    },
+    {
+      "id": "persistOnDisconnect",
+      "type": "switch",
+      "title": "Show Disconnected Status",
+      "description": "Keep a disconnected icon visible in the notch while the VPN is off (persistent mode only)",
+      "systemImage": "network.slash",
+      "tint": "red",
+      "default": false
+    }
+  ]
+}
