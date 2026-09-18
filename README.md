@@ -70,9 +70,10 @@ The test suite builds both architectures, checks the framed socket payload in th
 `com.nebulark.vpn-status`
 
 ## Version
-1.1.3
+1.1.4
 
 ## Changelog
+- **1.1.4** — Provider handshakes no longer flash the wrong logo (macOS can briefly report the old session as Connected while a new VPN connects); a fresh connection is only reported once it is seen twice in a row. Country/flag resolution now refreshes the notch in place instead of re-presenting the Sneak Peek a second time. Connect Sneak Peeks in persistent mode are now presented via a short-delayed update, since DynamicLake honours `presentSneakPeek` on updates only and swallows one racing the create.
 - **1.1.3** — Minimized side capsule (`extraLiveActivity`) now always shows the provider logo instead of the country flag; front compact view unchanged (logo + flag).
 - **1.1.2** — Fixed stale/wrong ProtonVPN flags after Quick Connect and reconnects; rejects Proton's idle utun interface unless public traffic is actually routed through it; detects transitions in under a second; resolves country asynchronously with a Proton-compatible HTTPS fallback; removes public IPs from logs; replaces the emoji with smaller 4:3 flag artwork centered on transparent canvases so rectangular flags are not stretched into square badges; and directly presents the same Sneak Peek on every connect, country/server, and disconnect change.
 - **1.1.0** — Flag now reflects the actual VPN exit country (self-lookup via ip-api), so ProtonVPN gets a flag and switching NordVPN country while connected refreshes it within ~30s without a reconnect. Mode switches (Notify on Change / Show Disconnected Status) now apply live without restarting DynamicLake.

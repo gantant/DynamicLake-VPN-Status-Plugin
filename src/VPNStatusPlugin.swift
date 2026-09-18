@@ -29,6 +29,10 @@ private let countryLookupRetrySec: TimeInterval = 2
 private let reassertIntervalSec: TimeInterval = 30
 private let countryRefreshIntervalSec: TimeInterval = 15
 private let sneakPeekPresentationSec: Double = 2
+/// DynamicLake only honours `presentSneakPeek` on updates, and swallows one sent
+/// in the same breath as the create — so the connect peek is presented via a
+/// short-delayed update, once the capsule is established.
+private let peekDelaySec: TimeInterval = 0.5
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -367,7 +371,7 @@ private func notifyPayload(connected: Bool, provider: String?, countryCode: Stri
     return payload
 }
 
-private func peekUpdatePayload(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
+private func peekUpdatePayload(connected: Bool, provider: String?, countryCode: String, countryName: String, presentPeek: Bool = true) -> [String: Any] {
     updateSequence += 1
     let surfaces = notifyComponents(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName)
     var payload: [String: Any] = [
@@ -377,7 +381,7 @@ private func peekUpdatePayload(connected: Bool, provider: String?, countryCode: 
         "activityID": activityID,
         "surfaces": surfaces
     ]
-    if supportsPresentSneakPeek {
+    if presentPeek, supportsPresentSneakPeek {
         payload["presentSneakPeek"] = sneakPeekPresentationSec
     }
     return payload
@@ -457,7 +461,11 @@ private enum Main {
         }
 
         var published = false
-        var lastSig = ""
+        var lastRawConnectionKey = ""
+        var stateConnected = false
+        var lastBaseSig = ""
+        var lastFullSig = ""
+        var pendingPeekAt: Date?
         var prevConnected: Bool?
         var lastMode: Bool?
         var dismissAt: Date?
@@ -501,6 +509,7 @@ private enum Main {
                 sendTracked(client, dismissPayload(), "dismiss mode-switch")
                 published = false
                 dismissAt = nil
+                pendingPeekAt = nil
             }
             if lastMode != notifyOnChange {
                 logEvent("mode=" + (notifyOnChange ? "notify" : "persistent"))
@@ -508,11 +517,25 @@ private enum Main {
 
             let now = Date()
             let vpn = getVPNStatus()
+
+            // macOS keeps the previous session marked Connected for a poll or two
+            // while a new VPN (e.g. NordVPN) finishes its handshake, and during the
+            // overlap `scutil --nc list` can report either service. Hold a fresh
+            // connection until the same one is seen twice so the stale provider
+            // never reaches the notch. Disconnects stay instant.
+            let rawConnectionKey = vpn.connected ? connectionKey(for: vpn) : ""
+            var state = vpn
+            if vpn.connected && !stateConnected && rawConnectionKey != lastRawConnectionKey {
+                state.connected = false
+            }
+            stateConnected = state.connected
+            lastRawConnectionKey = rawConnectionKey
+
             var connectionChanged = false
             var countryChanged = false
 
-            if vpn.connected {
-                let key = connectionKey(for: vpn)
+            if state.connected {
+                let key = connectionKey(for: state)
                 if key != countryConnectionKey {
                     countryGeneration &+= 1
                     countryConnectionKey = key
@@ -545,7 +568,7 @@ private enum Main {
                 }
             }
 
-            if vpn.connected, let probeAt = nextCountryProbeAt, now >= probeAt {
+            if state.connected, let probeAt = nextCountryProbeAt, now >= probeAt {
                 if routedTunnelInterface() == nil {
                     nextCountryProbeAt = now.addingTimeInterval(0.5)
                 } else if countryResolver.request(generation: countryGeneration) {
@@ -553,25 +576,27 @@ private enum Main {
                 }
             }
 
-            let sig = [
-                vpn.connected ? "1" : "0",
-                vpn.provider ?? "",
-                vpn.protocol_ ?? "",
-                vpn.serverAddress ?? "",
-                vpn.routedInterface ?? "",
-                currentCountryCode
+            // baseSig covers connect/disconnect/provider/server changes (each one
+            // deserves a presented peek); the country code only refreshes surfaces.
+            let baseSig = [
+                state.connected ? "1" : "0",
+                state.provider ?? "",
+                state.protocol_ ?? "",
+                state.serverAddress ?? "",
+                state.routedInterface ?? ""
             ].joined(separator: "|")
+            let sig = baseSig + "|" + currentCountryCode
 
             if notifyOnChange {
                 if let prev = prevConnected {
                     var transition: (connected: Bool, provider: String?, countryCode: String, countryName: String)?
-                    if vpn.connected && !prev {
-                        transition = (true, vpn.provider, currentCountryCode, currentCountryName)
-                        logEvent("notify-create connected=true provider=\(vpn.provider ?? "nil")")
-                    } else if vpn.connected && prev && connectionChanged {
-                        transition = (true, vpn.provider, currentCountryCode, currentCountryName)
-                        logEvent("notify-create connection-changed provider=\(vpn.provider ?? "nil")")
-                    } else if !vpn.connected && prev {
+                    if state.connected && !prev {
+                        transition = (true, state.provider, currentCountryCode, currentCountryName)
+                        logEvent("notify-create connected=true provider=\(state.provider ?? "nil")")
+                    } else if state.connected && prev && connectionChanged {
+                        transition = (true, state.provider, currentCountryCode, currentCountryName)
+                        logEvent("notify-create connection-changed provider=\(state.provider ?? "nil")")
+                    } else if !state.connected && prev {
                         transition = (false, nil, "", "")
                         logEvent("notify-create connected=false")
                     }
@@ -584,13 +609,15 @@ private enum Main {
                         }
                     }
                 }
-                prevConnected = vpn.connected
+                prevConnected = state.connected
 
-                if published, vpn.connected, countryChanged, !currentCountryCode.isEmpty {
+                if published, state.connected, countryChanged, !currentCountryCode.isEmpty {
+                    // The notification is still on screen: refresh it in place
+                    // (add the flag) instead of re-presenting the sneak peek.
                     sendTracked(
                         client,
-                        peekUpdatePayload(connected: true, provider: vpn.provider, countryCode: currentCountryCode, countryName: currentCountryName),
-                        "country update + peek"
+                        peekUpdatePayload(connected: true, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
+                        "country update"
                     )
                 }
 
@@ -605,7 +632,28 @@ private enum Main {
             } else {
                 prevConnected = nil
                 let persistDisconnected = readPersistOnDisconnect()
-                if !vpn.connected && !persistDisconnected {
+
+                if let peekAt = pendingPeekAt, now >= peekAt {
+                    pendingPeekAt = nil
+                    if published {
+                        // The capsule from the create is now established, so the
+                        // peek update is honoured (same path as the disconnect peek).
+                        if !sendTracked(
+                            client,
+                        peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                        "post-create peek"
+                        ) {
+                            published = false
+                            lastBaseSig = ""
+                            lastFullSig = ""
+                            reconnect()
+                        } else {
+                            logEvent("connect peek presented")
+                        }
+                    }
+                }
+
+                if !state.connected && !persistDisconnected {
                     if published, dismissAt == nil {
                         sendTracked(
                             client,
@@ -613,7 +661,8 @@ private enum Main {
                             "disconnect peek"
                         )
                         dismissAt = now.addingTimeInterval(notificationDurationSec)
-                        lastSig = sig
+                        lastBaseSig = baseSig
+                        lastFullSig = sig
                         logEvent("peek connected=false")
                     }
                     if published, let deadline = dismissAt, now >= deadline {
@@ -625,34 +674,53 @@ private enum Main {
                     }
                 } else {
                     dismissAt = nil
-                    if sig != lastSig {
+                    if baseSig != lastBaseSig {
+                        pendingPeekAt = nil
                         if published {
                             if !sendTracked(
                                 client,
-                                peekUpdatePayload(connected: vpn.connected, provider: vpn.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                                peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
                                 "update + peek"
                             ) {
                                 published = false
-                                lastSig = ""
+                                lastBaseSig = ""
+                                lastFullSig = ""
                                 reconnect()
                             }
-                        } else if sendTracked(client, createPayload(connected: vpn.connected, provider: vpn.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
+                        } else if sendTracked(client, createPayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
                             published = true
                             lastReassertAt = now
-                            sendTracked(
-                                client,
-                                peekUpdatePayload(connected: vpn.connected, provider: vpn.provider, countryCode: currentCountryCode, countryName: currentCountryName),
-                                "create peek"
-                            )
+                            // Present the peek shortly after the capsule appears:
+                            // DynamicLake ignores presentSneakPeek on creates and
+                            // on updates racing the create.
+                            pendingPeekAt = now.addingTimeInterval(peekDelaySec)
                         }
-                        lastSig = sig
-                    } else if published, let last = lastReassertAt,
-                              now.timeIntervalSince(last) >= reassertIntervalSec {
-                        if sendTracked(client, createPayload(connected: vpn.connected, provider: vpn.provider, countryCode: currentCountryCode, countryName: currentCountryName), "reassert create") {
-                            lastReassertAt = now
+                        lastBaseSig = baseSig
+                        lastFullSig = sig
+                    } else if published, sig != lastFullSig {
+                        // Only the country flag changed: refresh the live activity
+                        // in place instead of re-presenting the sneak peek.
+                        if sendTracked(
+                            client,
+                            peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
+                            "country update"
+                        ) {
+                            lastFullSig = sig
                         } else {
                             published = false
-                            lastSig = ""
+                            lastBaseSig = ""
+                            lastFullSig = ""
+                            reconnect()
+                        }
+                    } else if published, let last = lastReassertAt,
+                              now.timeIntervalSince(last) >= reassertIntervalSec {
+                        if sendTracked(client, createPayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "reassert create") {
+                            lastReassertAt = now
+                            lastFullSig = sig
+                        } else {
+                            published = false
+                            lastBaseSig = ""
+                            lastFullSig = ""
                             reconnect()
                         }
                     }

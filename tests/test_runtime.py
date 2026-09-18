@@ -47,7 +47,9 @@ def main() -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(socket_path))
         server.listen(1)
-        server.settimeout(5)
+        # First exec of a freshly built binary can stall in Gatekeeper's scan;
+        # give the plugin generous time to attach.
+        server.settimeout(15)
 
         environment = os.environ.copy()
         environment.update(
@@ -72,7 +74,7 @@ def main() -> None:
             while time.monotonic() < deadline:
                 try:
                     frames.append(receive_frame(connection))
-                except TimeoutError:
+                except (socket.timeout, TimeoutError):
                     continue
                 if any(
                     frame.get("surfaces", {})
