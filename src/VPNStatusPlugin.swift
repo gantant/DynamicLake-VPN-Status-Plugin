@@ -27,12 +27,24 @@ private let geoLookupTimeoutSec: TimeInterval = 2
 private let countryLookupSettleSec: TimeInterval = 0.8
 private let countryLookupRetrySec: TimeInterval = 2
 private let reassertIntervalSec: TimeInterval = 30
+/// While connected, the exit-country lookup re-runs on this cadence so a server
+/// switch without a service change (or a missed probe) still refreshes the flag.
 private let countryRefreshIntervalSec: TimeInterval = 15
 private let sneakPeekPresentationSec: Double = 2
 /// DynamicLake only honours `presentSneakPeek` on updates, and swallows one sent
 /// in the same breath as the create — so the connect peek is presented via a
 /// short-delayed update, once the capsule is established.
 private let peekDelaySec: TimeInterval = 0.5
+/// On connect, the peek additionally waits for the exit-country lookup so it can
+/// show logo + country + flag in one presentation. Bounded so a slow or failed
+/// lookup still peeks (just without the country) instead of never firing.
+private let peekCountryWaitSec: TimeInterval = 2.5
+private let peekCountryRecheckSec: TimeInterval = 0.25
+/// Once the country arrives while a peek is pending, the flag refresh is sent
+/// first; the peek follows this much later as a pure presentation update.
+private let peekCountryLeadSec: TimeInterval = 0.3
+/// Keep in sync with the version in plugin.json.
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.5"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -102,7 +114,7 @@ private final class ExitCountryResolver {
         request.timeoutInterval = geoLookupTimeoutSec
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("text/plain, application/json", forHTTPHeaderField: "Accept")
-        request.setValue("VPNStatus-DynamicLake/1.1.2", forHTTPHeaderField: "User-Agent")
+        request.setValue(pluginUserAgent, forHTTPHeaderField: "User-Agent")
 
         session.dataTask(with: request) { [weak self] data, response, _ in
             if let http = response as? HTTPURLResponse,
@@ -135,6 +147,9 @@ private final class ExitCountryResolver {
     }
 }
 
+/// Extracts the service name from a `scutil --nc list` line. Services are named
+/// "<Provider> <Protocol>" (e.g. "ProtonVPN IKEv2"); the name is the last quoted
+/// segment of the line.
 private func quotedServiceName(in line: String) -> String {
     var inQuote = false
     var serviceName = ""
@@ -269,7 +284,7 @@ private func flagSlot(_ countryCode: String) -> [String: Any]? {
     countryFlagImagePayload(countryCode: countryCode)
 }
 
-private func compactSurface(connected: Bool, provider: String?, countryCode: String = "") -> [String: Any] {
+private func compactSurface(connected: Bool, provider: String?, countryCode: String) -> [String: Any] {
     var surface: [String: Any] = ["leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon()]
     if let slot = flagSlot(countryCode) {
         surface["rightSlot"] = slot
@@ -285,11 +300,10 @@ private func extraLiveActivitySurface(connected: Bool, provider: String?) -> [St
     ["leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon()]
 }
 
-private func statusSneakPeek(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
-    let providerName = provider?.replacingOccurrences(of: "ProtonVPN", with: "Proton VPN") ?? "VPN"
-    var detail = connected ? "\(providerName) connected" : "VPN disconnected"
-    if connected, !countryName.isEmpty { detail = "\(providerName) · \(countryName)" }
-    var surface: [String: Any] = [
+/// Shared sneak-peek shape: provider logo + detail text + optional country flag.
+/// Used by both persistent-mode and notify-mode peeks.
+private func makeSneakPeek(connected: Bool, provider: String?, countryCode: String, detail: String) -> [String: Any] {
+    var peek: [String: Any] = [
         "leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon(),
         "center": [
             "type": "text",
@@ -297,11 +311,22 @@ private func statusSneakPeek(connected: Bool, provider: String?, countryCode: St
             "text": detail,
             "style": "compact"
         ]
-    ] as [String: Any]
+    ]
     if let slot = flagSlot(countryCode) {
-        surface["rightSlot"] = slot
+        peek["rightSlot"] = slot
     }
-    return surface
+    return peek
+}
+
+private func providerDisplayName(_ provider: String?) -> String {
+    provider?.replacingOccurrences(of: "ProtonVPN", with: "Proton VPN") ?? "VPN"
+}
+
+private func statusSneakPeek(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
+    let providerName = providerDisplayName(provider)
+    var detail = connected ? "\(providerName) connected" : "VPN disconnected"
+    if connected, !countryName.isEmpty { detail = "\(providerName) · \(countryName)" }
+    return makeSneakPeek(connected: connected, provider: provider, countryCode: countryCode, detail: detail)
 }
 
 private func createPayload(connected: Bool, provider: String?, countryCode: String, countryName: String = "") -> [String: Any] {
@@ -324,24 +349,10 @@ private func createPayload(connected: Bool, provider: String?, countryCode: Stri
 private var updateSequence: UInt64 = 0
 
 private func notifyComponents(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
-    let icon: [String: Any] = connected
-        ? vpnIconPayload(for: provider)
-        : disconnectedIcon()
-    let providerName = provider?.replacingOccurrences(of: "ProtonVPN", with: "Proton VPN") ?? "VPN"
+    let providerName = providerDisplayName(provider)
     var detail = connected ? "\(providerName) connected" : "VPN disconnected"
     if connected, !countryName.isEmpty { detail = "Connected to \(countryName)" }
-    var sneakPeek: [String: Any] = [
-        "leftSlot": icon,
-        "center": [
-            "type": "text",
-            "id": "vpn-detail",
-            "text": detail,
-            "style": "compact"
-        ]
-    ]
-    if let slot = flagSlot(countryCode) {
-        sneakPeek["rightSlot"] = slot
-    }
+    let sneakPeek = makeSneakPeek(connected: connected, provider: provider, countryCode: countryCode, detail: detail)
     return [
         "compactLiveActivity": compactSurface(connected: connected, provider: provider, countryCode: countryCode),
         "sneakPeek": sneakPeek,
@@ -401,16 +412,23 @@ private func dismissPayload() -> [String: Any] {
 /// only a snapshot from process launch and never updates for a running plugin.
 private func readBoolSetting(_ id: String, envKey: String) -> Bool {
     if let settingsPath = ProcessInfo.processInfo.environment[settingsPathEnvironmentKey],
-       let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let values = obj["values"] as? [String: Any] {
-        return values[id] as? Bool ?? false
+       let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)) {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let values = obj["values"] as? [String: Any] {
+            return values[id] as? Bool ?? false
+        }
+        if !settingsParseFailureLogged {
+            settingsParseFailureLogged = true
+            logEvent("settings parse failed at \(settingsPath); falling back to env/defaults")
+        }
     }
     if let env = ProcessInfo.processInfo.environment[envKey] {
         return env == "true" || env == "1"
     }
     return false
 }
+
+private var settingsParseFailureLogged = false
 
 private func readNotifyOnChange() -> Bool {
     readBoolSetting("notifyOnChange", envKey: "DYNAMICLAKE_SETTING_NOTIFY_ON_CHANGE")
@@ -466,6 +484,7 @@ private enum Main {
         var lastBaseSig = ""
         var lastFullSig = ""
         var pendingPeekAt: Date?
+        var peekScheduledAt: Date?
         var prevConnected: Bool?
         var lastMode: Bool?
         var dismissAt: Date?
@@ -510,6 +529,11 @@ private enum Main {
                 published = false
                 dismissAt = nil
                 pendingPeekAt = nil
+                peekScheduledAt = nil
+                // Reset the surfaces signatures too, or the fresh mode's first
+                // capsule/notification could be skipped as "unchanged".
+                lastBaseSig = ""
+                lastFullSig = ""
             }
             if lastMode != notifyOnChange {
                 logEvent("mode=" + (notifyOnChange ? "notify" : "persistent"))
@@ -563,6 +587,12 @@ private enum Main {
                         currentCountryName = result.name
                         countryChanged = true
                         logEvent("country=\(result.code)")
+                        if pendingPeekAt != nil {
+                            // A connect peek is waiting for this country: let the
+                            // flag refresh go first (this poll), then present the
+                            // peek on the refreshed, unchanged surfaces.
+                            pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
+                        }
                     }
                     nextCountryProbeAt = now.addingTimeInterval(countryRefreshIntervalSec)
                 }
@@ -634,8 +664,17 @@ private enum Main {
                 let persistDisconnected = readPersistOnDisconnect()
 
                 if let peekAt = pendingPeekAt, now >= peekAt {
-                    pendingPeekAt = nil
-                    if published {
+                    let awaitingCountry = state.connected && currentCountryCode.isEmpty
+                    let countryWaitExpired = peekScheduledAt.map { now.timeIntervalSince($0) >= peekCountryWaitSec } ?? true
+                    if awaitingCountry && !countryWaitExpired {
+                        // Hold the peek until the country lookup resolves so it can
+                        // show the flag — but only up to peekCountryWaitSec.
+                        pendingPeekAt = now.addingTimeInterval(peekCountryRecheckSec)
+                    } else {
+                        pendingPeekAt = nil
+                        peekScheduledAt = nil
+                    }
+                    if pendingPeekAt == nil, published {
                         // The capsule from the create is now established, so the
                         // peek update is honoured (same path as the disconnect peek).
                         if !sendTracked(
@@ -649,21 +688,34 @@ private enum Main {
                             reconnect()
                         } else {
                             logEvent("connect peek presented")
+                            // Sync the signatures so nothing re-sends these surfaces
+                            // while the peek is on screen.
+                            lastBaseSig = baseSig
+                            lastFullSig = sig
                         }
                     }
                 }
 
                 if !state.connected && !persistDisconnected {
                     if published, dismissAt == nil {
-                        sendTracked(
+                        if !sendTracked(
                             client,
                             peekUpdatePayload(connected: false, provider: nil, countryCode: "", countryName: ""),
                             "disconnect peek"
-                        )
-                        dismissAt = now.addingTimeInterval(notificationDurationSec)
-                        lastBaseSig = baseSig
-                        lastFullSig = sig
-                        logEvent("peek connected=false")
+                        ) {
+                            // The socket died mid-disconnect: drop the published
+                            // state so the next poll rebuilds a fresh capsule for
+                            // the peek instead of leaving a stale one stuck.
+                            published = false
+                            lastBaseSig = ""
+                            lastFullSig = ""
+                            reconnect()
+                        } else {
+                            dismissAt = now.addingTimeInterval(notificationDurationSec)
+                            lastBaseSig = baseSig
+                            lastFullSig = sig
+                            logEvent("peek connected=false")
+                        }
                     }
                     if published, let deadline = dismissAt, now >= deadline {
                         if !sendTracked(client, dismissPayload(), "dismiss disconnected") {
@@ -676,6 +728,7 @@ private enum Main {
                     dismissAt = nil
                     if baseSig != lastBaseSig {
                         pendingPeekAt = nil
+                        peekScheduledAt = nil
                         if published {
                             if !sendTracked(
                                 client,
@@ -692,14 +745,20 @@ private enum Main {
                             lastReassertAt = now
                             // Present the peek shortly after the capsule appears:
                             // DynamicLake ignores presentSneakPeek on creates and
-                            // on updates racing the create.
+                            // on updates racing the create. While connected, the
+                            // peek then also waits for the country (see above).
                             pendingPeekAt = now.addingTimeInterval(peekDelaySec)
+                            peekScheduledAt = now
                         }
                         lastBaseSig = baseSig
                         lastFullSig = sig
                     } else if published, sig != lastFullSig {
                         // Only the country flag changed: refresh the live activity
-                        // in place instead of re-presenting the sneak peek.
+                        // in place instead of re-presenting the sneak peek. While a
+                        // connect peek is pending this must go FIRST: DynamicLake
+                        // ignores presentSneakPeek on an update that also changes
+                        // surfaces, so the peek is sent afterwards as a pure
+                        // presentation update on the refreshed (unchanged) surfaces.
                         if sendTracked(
                             client,
                             peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
