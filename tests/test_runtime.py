@@ -96,12 +96,14 @@ def main() -> None:
             # Minimized (ELA) capsule must always be the provider logo, never the flag.
             assert "rightSlot" not in extra
             assert extra["leftSlot"] == compact["leftSlot"]
-            vpn_state = subprocess.run(
+            scutil_lines = subprocess.run(
                 ["/usr/sbin/scutil", "--nc", "status", "ProtonVPN"],
                 check=False,
                 capture_output=True,
                 text=True,
-            ).stdout.splitlines()[0]
+            ).stdout.splitlines()
+            # ProtonVPN may not be installed on this machine at all.
+            vpn_state = scutil_lines[0] if scutil_lines else ""
             if vpn_state == "Connected":
                 assert compact["leftSlot"]["source"] == "inlineData"
                 flagged = next(

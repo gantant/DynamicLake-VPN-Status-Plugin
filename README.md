@@ -61,7 +61,7 @@ ditto -c -k --keepParent VPNStatus.dynamiclakeplugin VPNStatus.dynamiclakeplugin
 The test suite builds both architectures, checks the framed socket payload in the current ProtonVPN state, guards against the idle-utun false positive when disconnected, and verifies that the bundled country flag is a valid PNG delivered through DynamicLake's inline-image payload when connected.
 
 ## Settings
-- `notifyOnChange` (switch, default off): **OFF (default):** a persistent small live activity stays in the notch while connected. A brief Sneak Peek is actively presented on every connection, country/server, and disconnection change; after disconnect it remains visible for about four seconds before dismissal. **ON:** no persistent activity; only the same brief change notifications appear and then fully dismiss. To test: enable it, then connect or disconnect your VPN.
+- `notifyOnChange` (switch, default off): **OFF (default):** a persistent small live activity stays in the notch while connected. A brief Sneak Peek is actively presented on every connection, country/server, and disconnection change; after disconnect the capsule remains visible for about four seconds before dismissal. **ON:** no persistent activity; the same brief notifications appear on changes and dismiss themselves after about four seconds. To test: enable it, then connect or disconnect your VPN.
 - `persistOnDisconnect` (switch, default off, persistent mode only): when enabled, the live activity stays in the notch even while the VPN is off (shows a red disconnected icon). When disabled, turning the VPN off dismisses the activity.
 - The automatic peek (`presentSneakPeek`) only fires when DynamicLake advertises the `presentSneakPeek` protocol feature (see `DYNAMICLAKE_PLUGIN_FEATURES` in the startup log); otherwise the same update is sent without the field and the peek simply shows on hover instead.
 - Debug events (mode switches, notification creates/dismisses, send errors) are written to `~/Library/Logs/vpn-status.log`.
@@ -70,9 +70,10 @@ The test suite builds both architectures, checks the framed socket payload in th
 `com.nebulark.vpn-status`
 
 ## Version
-1.1.4
+1.1.5
 
 ## Changelog
+- **1.1.5** — Hardened the socket layer (bounded send retries, kill-escalation for hung subprocesses, socket-blip recovery on disconnect peeks) and reset surfaces signatures on mode switches so a notify→persistent toggle always rebuilds the capsule. Sneak-peek surface construction deduplicated; settings-file parse failures are now logged (once).
 - **1.1.4** — Provider handshakes no longer flash the wrong logo (macOS can briefly report the old session as Connected while a new VPN connects); a fresh connection is only reported once it is seen twice in a row. Country/flag resolution now refreshes the notch in place instead of re-presenting the Sneak Peek a second time. Connect Sneak Peeks in persistent mode are now presented via a short-delayed update, since DynamicLake honours `presentSneakPeek` on updates only and swallows one racing the create.
 - **1.1.3** — Minimized side capsule (`extraLiveActivity`) now always shows the provider logo instead of the country flag; front compact view unchanged (logo + flag).
 - **1.1.2** — Fixed stale/wrong ProtonVPN flags after Quick Connect and reconnects; rejects Proton's idle utun interface unless public traffic is actually routed through it; detects transitions in under a second; resolves country asynchronously with a Proton-compatible HTTPS fallback; removes public IPs from logs; replaces the emoji with smaller 4:3 flag artwork centered on transparent canvases so rectangular flags are not stretched into square badges; and directly presents the same Sneak Peek on every connect, country/server, and disconnect change.

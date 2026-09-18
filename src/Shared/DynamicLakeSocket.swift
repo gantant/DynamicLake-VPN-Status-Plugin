@@ -4,6 +4,9 @@ import Foundation
 public let DynamicLakeMaxFrameSize = 64 * 1024
 public let DynamicLakePollIntervalUs: UInt32 = 50_000
 public let DynamicLakeSendRetryDelayUs: UInt32 = 10_000
+/// Bounds how long `sendAll` waits on a full socket buffer before failing, so a
+/// wedged DynamicLake feeds the plugin's reconnect path instead of hanging it.
+public let DynamicLakeSendMaxRetries = 100
 
 public enum DynamicLakeSocketError: Error, CustomStringConvertible {
     case socketPathMissing(String)
@@ -76,11 +79,6 @@ public final class JSONSocketClient {
         try sendAll(frame)
     }
 
-    @discardableResult
-    public func drainIncoming() -> Int {
-        receiveAvailable().count
-    }
-
     public func receiveAvailable() -> [[String: Any]] {
         guard fileDescriptor >= 0 else { return [] }
         var tmp = [UInt8](repeating: 0, count: 4096)
@@ -115,11 +113,19 @@ public final class JSONSocketClient {
         try data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var sent = 0
+            var retries = 0
             while sent < data.count {
                 let r = Darwin.send(fileDescriptor, base.advanced(by: sent), data.count - sent, 0)
-                if r > 0 { sent += r; continue }
+                if r > 0 { sent += r; retries = 0; continue }
                 if r < 0 && errno == EINTR { continue }
-                if r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(DynamicLakeSendRetryDelayUs); continue }
+                if r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    retries += 1
+                    guard retries <= DynamicLakeSendMaxRetries else {
+                        throw DynamicLakeSocketError.socket("send failed: socket buffer full after \(DynamicLakeSendMaxRetries) retries")
+                    }
+                    usleep(DynamicLakeSendRetryDelayUs)
+                    continue
+                }
                 throw DynamicLakeSocketError.socket("send failed")
             }
         }
@@ -144,7 +150,17 @@ public func runProcess(_ path: String, arguments: [String], timeout: TimeInterva
         usleep(DynamicLakePollIntervalUs)
     }
     if proc.isRunning {
+        // Graceful stop first; escalate to SIGKILL so a hung child (or a hung
+        // readDataToEndOfFile on its pipes) can never stall the poll loop.
         proc.terminate()
+        let killDeadline = Date().addingTimeInterval(0.5)
+        while proc.isRunning && Date() < killDeadline {
+            usleep(DynamicLakePollIntervalUs)
+        }
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+        }
+        proc.waitUntilExit()
     }
     let data = outPipe.fileHandleForReading.readDataToEndOfFile()
     _ = errPipe.fileHandleForReading.readDataToEndOfFile()
