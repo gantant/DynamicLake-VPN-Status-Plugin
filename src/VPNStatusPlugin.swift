@@ -40,9 +40,9 @@ private let peekDelaySec: TimeInterval = 0.5
 /// lookup still peeks (just without the country) instead of never firing.
 private let peekCountryWaitSec: TimeInterval = 2.5
 private let peekCountryRecheckSec: TimeInterval = 0.25
-/// Once the country arrives while a peek is pending, present it this much later
-/// (the next poll iteration).
-private let peekCountryLeadSec: TimeInterval = 0.2
+/// Once the country arrives while a peek is pending, the flag refresh is sent
+/// first; the peek follows this much later as a pure presentation update.
+private let peekCountryLeadSec: TimeInterval = 0.3
 /// Keep in sync with the version in plugin.json.
 private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.5"
 
@@ -588,7 +588,9 @@ private enum Main {
                         countryChanged = true
                         logEvent("country=\(result.code)")
                         if pendingPeekAt != nil {
-                            // A connect peek is waiting for this country: present it now.
+                            // A connect peek is waiting for this country: let the
+                            // flag refresh go first (this poll), then present the
+                            // peek on the refreshed, unchanged surfaces.
                             pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
                         }
                     }
@@ -686,10 +688,8 @@ private enum Main {
                             reconnect()
                         } else {
                             logEvent("connect peek presented")
-                            // The peek update already carries the current country/flag
-                            // surfaces: sync the signatures or the country-refresh
-                            // branch will send a duplicate update in the same breath,
-                            // which cancels the just-started peek presentation.
+                            // Sync the signatures so nothing re-sends these surfaces
+                            // while the peek is on screen.
                             lastBaseSig = baseSig
                             lastFullSig = sig
                         }
@@ -752,12 +752,13 @@ private enum Main {
                         }
                         lastBaseSig = baseSig
                         lastFullSig = sig
-                    } else if published, pendingPeekAt == nil, sig != lastFullSig {
+                    } else if published, sig != lastFullSig {
                         // Only the country flag changed: refresh the live activity
-                        // in place instead of re-presenting the sneak peek.
-                        // Skipped while a connect peek is pending — the peek update
-                        // already delivers the flag, and a second update right then
-                        // would cancel the peek.
+                        // in place instead of re-presenting the sneak peek. While a
+                        // connect peek is pending this must go FIRST: DynamicLake
+                        // ignores presentSneakPeek on an update that also changes
+                        // surfaces, so the peek is sent afterwards as a pure
+                        // presentation update on the refreshed (unchanged) surfaces.
                         if sendTracked(
                             client,
                             peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
