@@ -373,12 +373,9 @@ private func notifyPayload(connected: Bool, provider: String?, countryCode: Stri
         "size": "normal",
         "surfaces": surfaces
     ]
-    // Put the presentation request on the create command itself. This gives
-    // connect and disconnect notifications identical Sneak Peek behaviour and
-    // avoids relying on a follow-up update arriving in time.
-    if supportsPresentSneakPeek {
-        payload["presentSneakPeek"] = sneakPeekPresentationSec
-    }
+    // Note: presentSneakPeek is NOT put on the create — DynamicLake ignores it
+    // there. The shared delayed peek update below the mode branch presents it,
+    // exactly like persistent mode.
     return payload
 }
 
@@ -617,6 +614,48 @@ private enum Main {
             ].joined(separator: "|")
             let sig = baseSig + "|" + currentCountryCode
 
+            // Shared by both modes: present a scheduled peek via a delayed update
+            // on unchanged surfaces (the only shape DynamicLake reliably honours).
+            if let peekAt = pendingPeekAt, now >= peekAt {
+                let awaitingCountry = state.connected && currentCountryCode.isEmpty
+                let countryWaitExpired = peekScheduledAt.map { now.timeIntervalSince($0) >= peekCountryWaitSec } ?? true
+                if awaitingCountry && !countryWaitExpired {
+                    // Hold the peek until the country lookup resolves so it can
+                    // show the flag — but only up to peekCountryWaitSec.
+                    pendingPeekAt = now.addingTimeInterval(peekCountryRecheckSec)
+                } else {
+                    pendingPeekAt = nil
+                    peekScheduledAt = nil
+                }
+                if pendingPeekAt == nil, published {
+                    // The capsule/notification from the create is now established,
+                    // so the peek update is honoured (same path as the disconnect
+                    // peek and the v1.1.4 connect peek).
+                    if !sendTracked(
+                        client,
+                        peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                        "post-create peek"
+                    ) {
+                        published = false
+                        lastBaseSig = ""
+                        lastFullSig = ""
+                        reconnect()
+                    } else {
+                        logEvent("sneak peek presented")
+                        // Sync the signatures so nothing re-sends these surfaces
+                        // while the peek is on screen.
+                        lastBaseSig = baseSig
+                        lastFullSig = sig
+                        // Notify mode (and the persistent disconnect capsule) dismiss
+                        // on a timer set at create time; make sure the peek gets its
+                        // full duration before that dismissal.
+                        if let deadline = dismissAt {
+                            dismissAt = max(deadline, now.addingTimeInterval(sneakPeekPresentationSec + 0.25))
+                        }
+                    }
+                }
+            }
+
             if notifyOnChange {
                 if let prev = prevConnected {
                     var transition: (connected: Bool, provider: String?, countryCode: String, countryName: String)?
@@ -634,6 +673,11 @@ private enum Main {
                         if sendTracked(client, notifyPayload(connected: n.connected, provider: n.provider, countryCode: n.countryCode, countryName: n.countryName), "notify create") {
                             published = true
                             dismissAt = now.addingTimeInterval(notificationDurationSec)
+                            // Same delayed peek as persistent mode: the shared peek
+                            // block above presents it once the notification capsule
+                            // is established (DynamicLake ignores peeks on creates).
+                            pendingPeekAt = now.addingTimeInterval(peekDelaySec)
+                            peekScheduledAt = now
                         } else {
                             reconnect()
                         }
@@ -644,6 +688,9 @@ private enum Main {
                 if published, state.connected, countryChanged, !currentCountryCode.isEmpty {
                     // The notification is still on screen: refresh it in place
                     // (add the flag) instead of re-presenting the sneak peek.
+                    // When a peek is pending it is held for this country, so this
+                    // refresh lands first and the shared peek block presents the
+                    // peek on the refreshed surfaces next cycle.
                     sendTracked(
                         client,
                         peekUpdatePayload(connected: true, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
@@ -662,39 +709,6 @@ private enum Main {
             } else {
                 prevConnected = nil
                 let persistDisconnected = readPersistOnDisconnect()
-
-                if let peekAt = pendingPeekAt, now >= peekAt {
-                    let awaitingCountry = state.connected && currentCountryCode.isEmpty
-                    let countryWaitExpired = peekScheduledAt.map { now.timeIntervalSince($0) >= peekCountryWaitSec } ?? true
-                    if awaitingCountry && !countryWaitExpired {
-                        // Hold the peek until the country lookup resolves so it can
-                        // show the flag — but only up to peekCountryWaitSec.
-                        pendingPeekAt = now.addingTimeInterval(peekCountryRecheckSec)
-                    } else {
-                        pendingPeekAt = nil
-                        peekScheduledAt = nil
-                    }
-                    if pendingPeekAt == nil, published {
-                        // The capsule from the create is now established, so the
-                        // peek update is honoured (same path as the disconnect peek).
-                        if !sendTracked(
-                            client,
-                        peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
-                        "post-create peek"
-                        ) {
-                            published = false
-                            lastBaseSig = ""
-                            lastFullSig = ""
-                            reconnect()
-                        } else {
-                            logEvent("connect peek presented")
-                            // Sync the signatures so nothing re-sends these surfaces
-                            // while the peek is on screen.
-                            lastBaseSig = baseSig
-                            lastFullSig = sig
-                        }
-                    }
-                }
 
                 if !state.connected && !persistDisconnected {
                     if published, dismissAt == nil {
@@ -730,15 +744,21 @@ private enum Main {
                         pendingPeekAt = nil
                         peekScheduledAt = nil
                         if published {
+                            // Surface change only — the peek is scheduled separately,
+                            // since presentSneakPeek on a surface-changing update is
+                            // ignored by DynamicLake.
                             if !sendTracked(
                                 client,
-                                peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
-                                "update + peek"
+                                peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
+                                "surface update"
                             ) {
                                 published = false
                                 lastBaseSig = ""
                                 lastFullSig = ""
                                 reconnect()
+                            } else {
+                                pendingPeekAt = now.addingTimeInterval(peekDelaySec)
+                                peekScheduledAt = now
                             }
                         } else if sendTracked(client, createPayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
                             published = true
@@ -757,8 +777,9 @@ private enum Main {
                         // in place instead of re-presenting the sneak peek. While a
                         // connect peek is pending this must go FIRST: DynamicLake
                         // ignores presentSneakPeek on an update that also changes
-                        // surfaces, so the peek is sent afterwards as a pure
-                        // presentation update on the refreshed (unchanged) surfaces.
+                        // surfaces, so the shared peek block presents the peek
+                        // afterwards as a pure presentation update on the refreshed
+                        // (unchanged) surfaces.
                         if sendTracked(
                             client,
                             peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
