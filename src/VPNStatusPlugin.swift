@@ -5,18 +5,86 @@ private let pluginName = "VPN Status"
 private let activityID = "vpn-status"
 private let logPath = NSHomeDirectory() + "/Library/Logs/vpn-status.log"
 
+private let logMaxBytes: UInt64 = 256 * 1024
+private let logKeepBytes: UInt64 = 64 * 1024
+/// The same event repeated within this window is suppressed, so a hot retry
+/// loop adds at most one line per minute instead of one per poll.
+private let logRepeatWindowSec: TimeInterval = 60
+
+private let logLock = NSLock()
+private let logTimestampFormatter = ISO8601DateFormatter()
+private var lastLogMessage: String?
+private var lastLogAt: Date?
+private var suppressedLogRepeats = 0
+
+/// Appends a timestamped event to ~/Library/Logs/vpn-status.log. Deliberately
+/// bounded so it can never bloat the user's disk:
+/// - Consecutive identical events within `logRepeatWindowSec` collapse into
+///   one line with a repeat count.
+/// - The file rotates at `logMaxBytes`, keeping the most recent
+///   `logKeepBytes`.
+/// Called from the main loop and from resolver completion queues, so the lock
+/// keeps the suppression state and the writes consistent across threads.
+/// Public IP addresses are never logged.
 private func logEvent(_ message: String) {
-    let ts = ISO8601DateFormatter().string(from: Date())
-    let line = "\(ts) \(message)\n"
+    logLock.lock()
+    defer { logLock.unlock() }
+
+    let now = Date()
+    let withinWindow: Bool
+    if message == lastLogMessage, let last = lastLogAt {
+        withinWindow = now.timeIntervalSince(last) < logRepeatWindowSec
+    } else {
+        withinWindow = false
+    }
+
+    // A repeat run of the previous message ends here — a different message
+    // arrived, or the same one after the window expired. Emit its suppressed
+    // count as its own line so the count is never misattributed.
+    if suppressedLogRepeats > 0, !withinWindow, let lastMsg = lastLogMessage {
+        writeLogLine("\(logTimestampFormatter.string(from: lastLogAt ?? now)) \(lastMsg) (suppressed \(suppressedLogRepeats) repeats)")
+        suppressedLogRepeats = 0
+    }
+
+    if withinWindow {
+        suppressedLogRepeats += 1
+        return
+    }
+
+    lastLogMessage = message
+    lastLogAt = now
+    writeLogLine("\(logTimestampFormatter.string(from: now)) \(message)")
+}
+
+/// Appends one formatted line. Callers hold the log lock.
+private func writeLogLine(_ line: String) {
     let dir = (logPath as NSString).deletingLastPathComponent
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let text = line + "\n"
     if let h = FileHandle(forWritingAtPath: logPath) {
         defer { try? h.close() }
         h.seekToEndOfFile()
-        h.write(Data(line.utf8))
+        h.write(Data(text.utf8))
     } else {
-        try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
+        try? text.write(toFile: logPath, atomically: true, encoding: .utf8)
     }
+    trimLogIfNeeded()
+}
+
+/// Rewrites the log with only its most recent `logKeepBytes` (starting at a
+/// line boundary) once it exceeds `logMaxBytes`. Called with the log lock held.
+private func trimLogIfNeeded() {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+          let size = (attrs[.size] as? NSNumber)?.uint64Value,
+          size > logMaxBytes else { return }
+    guard let h = FileHandle(forReadingAtPath: logPath) else { return }
+    defer { try? h.close() }
+    h.seek(toFileOffset: size - logKeepBytes)
+    var data = h.readData(ofLength: Int(logKeepBytes) + 1)
+    if let nl = data.firstIndex(of: UInt8(ascii: "\n")) {
+        data = data.subdata(in: (nl + 1)..<data.count)
+    }
+    try? data.write(to: URL(fileURLWithPath: logPath), options: .atomic)
 }
 private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
 private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
@@ -43,7 +111,7 @@ private let peekCountryRecheckSec: TimeInterval = 0.25
 /// first; the peek follows this much later as a pure presentation update.
 private let peekCountryLeadSec: TimeInterval = 0.3
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.7"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.8"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -386,7 +454,7 @@ private func notifyComponents(connected: Bool, provider: String?, countryCode: S
 private func notifyPayload(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
     updateSequence += 1
     let surfaces = notifyComponents(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName)
-    var payload: [String: Any] = [
+    let payload: [String: Any] = [
         "schemaVersion": schemaVersion,
         "requestID": "notify-\(updateSequence)",
         "type": "create",
@@ -601,7 +669,8 @@ private enum Main {
                     // NordWhisper exposes only the station IP as ServerAddress
                     // (no hostname), so legacy configs resolve via the
                     // *.nordvpn.com hostname label and station IPs resolve via
-                    // Nord's public server catalog. On a virtual server like
+                    // the hardcoded virtual-location table. On a virtual
+                    // server like
                     // Armenia the geo-IP lookup can only ever report the
                     // physical country (BG), so a confirmed Nord location
                     // always overrides it.

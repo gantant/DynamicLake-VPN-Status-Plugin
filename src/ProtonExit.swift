@@ -220,19 +220,33 @@ final class ProtonExitResolver {
     private let ipv4RouteCheck: () -> String?
     private let hostRouteCheck: (String) -> String?
     private let logger: (String) -> Void
+    /// Routine per-probe lines (`probe started`, `exit stable country=`) fire
+    /// on every 5s re-probe while connected and would grow the log without
+    /// bound, so production leaves this off; anomaly lines (route mismatch,
+    /// unstable pair, stale discards) always log. Tests opt in to assert on
+    /// the routine lines.
+    private let logsRoutineDiagnostics: Bool
 
     init(
         probeGap: TimeInterval = protonExitProbeGapSec,
         session: URLSession = URLSession(configuration: .ephemeral),
         ipv4RouteCheck: @escaping () -> String? = ProtonExitResolver.defaultIPv4Route,
         hostRouteCheck: @escaping (String) -> String? = { routeInterfaceForHost($0) },
-        logger: @escaping (String) -> Void = { _ in }
+        logger: @escaping (String) -> Void = { _ in },
+        logsRoutineDiagnostics: Bool = false
     ) {
         self.probeGap = probeGap
         self.session = session
         self.ipv4RouteCheck = ipv4RouteCheck
         self.hostRouteCheck = hostRouteCheck
         self.logger = logger
+        self.logsRoutineDiagnostics = logsRoutineDiagnostics
+    }
+
+    /// Only for lines that fire every probe; anomalies bypass this.
+    private func routineLog(_ message: String) {
+        guard logsRoutineDiagnostics else { return }
+        logger(message)
     }
 
     static func defaultIPv4Route() -> String? {
@@ -258,7 +272,7 @@ final class ProtonExitResolver {
         lock.unlock()
 
         // NOTE: the public exit IP is intentionally never logged.
-        logger("proton exit probe started generation=\(generation)")
+        routineLog("proton exit probe started generation=\(generation)")
         let fetch = fetchIdentity ?? self.fetchExitIdentity
         let routeBefore = ipv4RouteCheck()
         guard routeBefore != nil else {
@@ -334,7 +348,7 @@ final class ProtonExitResolver {
                 finish(nil, generation: generation)
                 return
             }
-            logger("proton exit stable country=\(probe.countryCode)")
+            routineLog("proton exit stable country=\(probe.countryCode)")
             finish(
                 ProtonExitIdentity(
                     ip: probe.ip,
