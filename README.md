@@ -69,6 +69,10 @@ The test suite builds both architectures, checks the framed socket payload in th
 ## Identifier
 `com.nebulark.vpn-status`
 
+## Authors
+- **gantant** ([@gantant](https://github.com/gantant)) — original plugin and ongoing development
+- **Rafael Reverberi** ([@rafaelreverberi](https://github.com/rafaelreverberi)) — ProtonVPN exit-country stabilization (1.1.6) and bundled flag artwork
+
 ## Version
 1.1.8
 
