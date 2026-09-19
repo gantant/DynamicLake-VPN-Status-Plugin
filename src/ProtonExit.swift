@@ -25,7 +25,7 @@ let protonExitProbeGapSec: TimeInterval = 0.4
 /// identity and must be re-checked to notice the switch.
 let protonExitRefreshIntervalSec: TimeInterval = 5
 /// Keep in sync with `pluginUserAgent` in VPNStatusPlugin.swift.
-let protonExitUserAgent = "VPNStatus-DynamicLake/1.1.6"
+let protonExitUserAgent = "VPNStatus-DynamicLake/1.1.7"
 
 /// True only for ProtonVPN. NordVPN (and every other provider, including nil)
 /// must keep the existing single-shot country behavior.

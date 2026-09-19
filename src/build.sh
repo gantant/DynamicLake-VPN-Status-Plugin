@@ -10,7 +10,7 @@ ZIP="../VPNStatus.dynamiclakeplugin.zip"
 SLICE_DIR=$(mktemp -d)
 trap 'rm -rf "$SLICE_DIR"' EXIT
 
-SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift VPNStatusPlugin.swift)
+SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift VPNStatusPlugin.swift)
 
 echo "==> Compiling arm64 slice"
 swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \

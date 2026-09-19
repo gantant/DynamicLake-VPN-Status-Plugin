@@ -43,7 +43,7 @@ private let peekCountryRecheckSec: TimeInterval = 0.25
 /// first; the peek follows this much later as a pure presentation update.
 private let peekCountryLeadSec: TimeInterval = 0.3
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.6"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.7"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -214,22 +214,32 @@ private func serverAddress(for serviceName: String) -> String? {
 
 private func getVPNStatus() -> VPNStatus {
     let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil)
+    var connectingProvider: String?
     let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "list"])
     if let str = String(data: out, encoding: .utf8) {
-        for line in str.components(separatedBy: "\n") where line.contains("(Connected)") {
-            let serviceName = quotedServiceName(in: line)
-            guard !serviceName.isEmpty else { continue }
-            let parts = serviceName.split(separator: " ", maxSplits: 1)
-            let provider = parts.count == 2 ? String(parts[0]) : serviceName
-            let proto = parts.count == 2 ? String(parts[1]) : serviceName
-            return VPNStatus(
-                connected: true,
-                provider: provider,
-                protocol_: proto,
-                serviceName: serviceName,
-                serverAddress: serverAddress(for: serviceName),
-                routedInterface: nil
-            )
+        for line in str.components(separatedBy: "\n") {
+            if line.contains("(Connected)") {
+                let serviceName = quotedServiceName(in: line)
+                guard !serviceName.isEmpty else { continue }
+                let parts = serviceName.split(separator: " ", maxSplits: 1)
+                let provider = parts.count == 2 ? String(parts[0]) : serviceName
+                let proto = parts.count == 2 ? String(parts[1]) : serviceName
+                return VPNStatus(
+                    connected: true,
+                    provider: provider,
+                    protocol_: proto,
+                    serviceName: serviceName,
+                    serverAddress: serverAddress(for: serviceName),
+                    routedInterface: nil
+                )
+            }
+            // A service mid-handshake names the provider that owns the tunnel
+            // scutil has not claimed yet — the key attribution signal for the
+            // routed-utun fallback below.
+            if connectingProvider == nil, line.contains("(Connecting)"),
+               let serviceName = quotedServiceName(in: line).split(separator: " ", maxSplits: 1).first {
+                connectingProvider = String(serviceName)
+            }
         }
     }
 
@@ -242,7 +252,7 @@ private func getVPNStatus() -> VPNStatus {
             onUtun = line.hasPrefix(routedInterface + ":")
         }
         if onUtun, hasRoutableAddress(line) {
-            let provider = detectProviderFast() ?? "VPN"
+            let provider = connectingProvider ?? detectProviderFast() ?? "VPN"
             return VPNStatus(
                 connected: true,
                 provider: provider,
@@ -257,16 +267,30 @@ private func getVPNStatus() -> VPNStatus {
     return disconnected
 }
 
+/// Last-resort provider attribution for the routed-utun fallback. Both
+/// provider apps keep GUI processes alive even while disconnected, so process
+/// presence alone cannot attribute a tunnel — prefer the scutil "(Connecting)"
+/// service (see getVPNStatus) whenever one exists. When neither app shows a
+/// connection state at all, pick the provider with the highest PID: macOS
+/// allocates PIDs monotonically, so a process freshly spawned for a connection
+/// outranks a long-idle one.
 private func detectProviderFast() -> String? {
-    let (out, _) = runProcess("/usr/bin/pgrep", arguments: ["-f", "ch.protonvpn.mac|/ProtonVPN"])
-    if let str = String(data: out, encoding: .utf8), !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return "ProtonVPN"
+    let candidates: [(pattern: String, provider: String)] = [
+        ("[pP]roton|ch\\.protonvpn", "ProtonVPN"),
+        ("[nN]ordvpn|NordWhisper", "NordVPN")
+    ]
+    var bestPid: Int32 = -1
+    var bestProvider: String?
+    for candidate in candidates {
+        let (out, _) = runProcess("/usr/bin/pgrep", arguments: ["-f", candidate.pattern])
+        guard let str = String(data: out, encoding: .utf8) else { continue }
+        for token in str.split(whereSeparator: { $0.isNewline || $0.isWhitespace }) {
+            guard let pid = Int32(token), pid > bestPid else { continue }
+            bestPid = pid
+            bestProvider = candidate.provider
+        }
     }
-    let (out2, _) = runProcess("/usr/bin/pgrep", arguments: ["-f", "com.nordvpn.macos.helper|/NordVPN"])
-    if let str = String(data: out2, encoding: .utf8), !str.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return "NordVPN"
-    }
-    return nil
+    return bestProvider
 }
 
 private func disconnectedIcon() -> [String: Any] {
@@ -571,6 +595,37 @@ private enum Main {
                     nextCountryProbeAt = now.addingTimeInterval(countryLookupSettleSec)
                     connectionChanged = true
                     countryChanged = true
+
+                    // The selected location (including virtual ones) comes from
+                    // NordVPN's own data, not from where the hardware sits:
+                    // NordWhisper exposes only the station IP as ServerAddress
+                    // (no hostname), so legacy configs resolve via the
+                    // *.nordvpn.com hostname label and station IPs resolve via
+                    // Nord's public server catalog. On a virtual server like
+                    // Armenia the geo-IP lookup can only ever report the
+                    // physical country (BG), so a confirmed Nord location
+                    // always overrides it.
+                    var nordLocation: (code: String, source: String)?
+                    if let code = nordServerCountryCode(from: state.serverAddress) {
+                        nordLocation = (code, "server host")
+                    } else if state.provider?.lowercased().contains("nord") == true,
+                              let code = nordVirtualLocationCountryCode(forIPv4: state.serverAddress) {
+                        nordLocation = (code, "virtual location table")
+                    } else if state.provider?.lowercased().contains("nord") == true,
+                              let addr = state.serverAddress, !addr.isEmpty {
+                        // Never log IPs: address literals are reduced to their
+                        // shape so an unexpected NordWhisper format shows up in
+                        // the log without exposing the address.
+                        logEvent("nord server address unresolved (\(serverAddressShape(addr))); using geo lookup")
+                    }
+                    if let location = nordLocation {
+                        currentCountryCode = location.code
+                        currentCountryName = Locale.current.localizedString(forRegionCode: location.code) ?? location.code
+                        // Skip the geo lookup for this connection: it would
+                        // contradict the selected location on virtual servers.
+                        nextCountryProbeAt = nil
+                        logEvent("country=\(location.code) (from \(location.source))")
+                    }
                 }
             } else if !countryConnectionKey.isEmpty || !currentCountryCode.isEmpty || !protonStableExitIP.isEmpty {
                 countryGeneration &+= 1
@@ -638,6 +693,31 @@ private enum Main {
                         }
                         nextCountryProbeAt = now.addingTimeInterval(countryRefreshIntervalSec)
                     }
+                }
+            }
+
+            // A geo-derived country can be wrong for a virtual location: the
+            // geo lookup reports the physical host country (e.g. BG for
+            // Armenia) and keeps refreshing it every 15s. When the picked
+            // location is recoverable from the station address, override the
+            // geo value unconditionally. Bumping the generation also discards
+            // the geo lookup still in flight for this connection so it cannot
+            // clobber the correction on arrival.
+            if state.connected,
+               state.provider?.lowercased().contains("nord") == true,
+               let code = nordVirtualLocationCountryCode(forIPv4: state.serverAddress),
+               code != currentCountryCode {
+                countryGeneration &+= 1
+                currentCountryCode = code
+                currentCountryName = Locale.current.localizedString(forRegionCode: code) ?? code
+                nextCountryProbeAt = nil
+                countryChanged = true
+                logEvent("country=\(code) (from virtual location table)")
+                if pendingPeekAt != nil {
+                    // Same ordering as the resolver path: the flag refresh goes
+                    // first (this poll), then the peek presents on the
+                    // refreshed, unchanged surfaces.
+                    pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
                 }
             }
 
