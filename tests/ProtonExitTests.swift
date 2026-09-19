@@ -283,7 +283,8 @@ private enum ProtonExitTests {
                 return routeCalls < routes.count ? routes[routeCalls] : routes.last ?? nil
             },
             hostRouteCheck: { _ in hostRoute },
-            logger: { sink.append($0) }
+            logger: { sink.append($0) },
+            logsRoutineDiagnostics: true
         )
         return (resolver, sink)
     }
