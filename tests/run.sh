@@ -6,7 +6,12 @@ cd "$(dirname "$0")/.."
 python3 tests/test_runtime.py
 
 TEST_BINARY=$(mktemp -t vpn-flag-smoke)
-trap 'rm -f "$TEST_BINARY"' EXIT
+PROTON_TEST_BINARY=$(mktemp -t vpn-proton-exit-tests)
+trap 'rm -f "$TEST_BINARY" "$PROTON_TEST_BINARY"' EXIT
 swiftc -parse-as-library -O -target "$(uname -m)-apple-macosx14.0" \
     -o "$TEST_BINARY" src/CountryFlagAsset.swift tests/FlagBadgeSmoke.swift
 DYNAMICLAKE_PLUGIN_PACKAGE_PATH="$PWD/src" "$TEST_BINARY"
+
+swiftc -O -target "$(uname -m)-apple-macosx14.0" \
+    -o "$PROTON_TEST_BINARY" src/Shared/DynamicLakeSocket.swift src/ProtonExit.swift tests/ProtonExitTests.swift
+"$PROTON_TEST_BINARY"

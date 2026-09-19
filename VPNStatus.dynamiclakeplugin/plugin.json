@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.nebulark.vpn-status",
   "name": "VPN Status",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "developerName": "Nebulark",
   "description": "Shows fast, accurate ProtonVPN and NordVPN status in the notch.",
   "executable": "vpn-status",
