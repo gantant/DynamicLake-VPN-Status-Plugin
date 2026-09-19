@@ -35,16 +35,15 @@ private let sneakPeekPresentationSec: Double = 2
 /// in the same breath as the create — so the connect peek is presented via a
 /// short-delayed update, once the capsule is established.
 private let peekDelaySec: TimeInterval = 0.5
-/// On connect, the peek additionally waits for the exit-country lookup so it can
-/// show logo + country + flag in one presentation. Bounded so a slow or failed
-/// lookup still peeks (just without the country) instead of never firing.
-private let peekCountryWaitSec: TimeInterval = 2.5
+/// On connect, the peek waits for the exit-country lookup so it always shows
+/// logo + country + flag in one presentation — it never peeks without the
+/// country while connected. Disconnect peeks are unaffected (no country).
 private let peekCountryRecheckSec: TimeInterval = 0.25
 /// Once the country arrives while a peek is pending, the flag refresh is sent
 /// first; the peek follows this much later as a pure presentation update.
 private let peekCountryLeadSec: TimeInterval = 0.3
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.5"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.6"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -481,17 +480,24 @@ private enum Main {
         var lastBaseSig = ""
         var lastFullSig = ""
         var pendingPeekAt: Date?
-        var peekScheduledAt: Date?
         var prevConnected: Bool?
         var lastMode: Bool?
         var dismissAt: Date?
         var currentCountryCode = ""
         var currentCountryName = ""
+        /// Last stabilized Proton exit IP. A Proton server switch does not
+        /// necessarily change the service name or utun interface, so the exit
+        /// IP is part of the effective Proton connection identity. NordVPN
+        /// never reads or writes this.
+        var protonStableExitIP = ""
         var countryGeneration: UInt64 = 0
         var countryConnectionKey = ""
         var nextCountryProbeAt: Date?
         var lastReassertAt: Date?
         let countryResolver = ExitCountryResolver()
+        // Proton-only stabilized exit resolver. NordVPN and every other
+        // provider keep using `countryResolver` above with unchanged behavior.
+        let protonResolver = ProtonExitResolver(logger: logEvent)
 
         func reconnect() {
             client.close()
@@ -526,7 +532,6 @@ private enum Main {
                 published = false
                 dismissAt = nil
                 pendingPeekAt = nil
-                peekScheduledAt = nil
                 // Reset the surfaces signatures too, or the fresh mode's first
                 // capsule/notification could be skipped as "unchanged".
                 lastBaseSig = ""
@@ -562,43 +567,86 @@ private enum Main {
                     countryConnectionKey = key
                     currentCountryCode = ""
                     currentCountryName = ""
+                    protonStableExitIP = ""
                     nextCountryProbeAt = now.addingTimeInterval(countryLookupSettleSec)
                     connectionChanged = true
                     countryChanged = true
                 }
-            } else if !countryConnectionKey.isEmpty || !currentCountryCode.isEmpty {
+            } else if !countryConnectionKey.isEmpty || !currentCountryCode.isEmpty || !protonStableExitIP.isEmpty {
                 countryGeneration &+= 1
                 countryConnectionKey = ""
                 currentCountryCode = ""
                 currentCountryName = ""
+                protonStableExitIP = ""
                 nextCountryProbeAt = nil
                 countryChanged = true
             }
 
-            if let result = countryResolver.takeResult(), result.generation == countryGeneration {
-                if result.code.isEmpty {
-                    nextCountryProbeAt = now.addingTimeInterval(countryLookupRetrySec)
-                } else {
-                    if result.code != currentCountryCode {
-                        currentCountryCode = result.code
-                        currentCountryName = result.name
-                        countryChanged = true
-                        logEvent("country=\(result.code)")
-                        if pendingPeekAt != nil {
-                            // A connect peek is waiting for this country: let the
-                            // flag refresh go first (this poll), then present the
-                            // peek on the refreshed, unchanged surfaces.
-                            pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
+            // Provider-specific exit lookup. ProtonVPN uses the stabilized
+            // two-probe exit-IP resolver; every other provider (notably
+            // NordVPN) uses the original single-shot country resolver with
+            // unchanged behavior. The inactive path is drained so a provider
+            // switch cannot leak the other path's pending result.
+            let protonActive = state.connected && usesProtonStabilizedExit(provider: state.provider)
+            if protonActive {
+                _ = countryResolver.takeResult()
+                if let result = protonResolver.takeResult() {
+                    if result.generation != countryGeneration {
+                        logEvent("stale exit lookup discarded generation=\(result.generation)")
+                    } else if result.countryCode.isEmpty {
+                        nextCountryProbeAt = now.addingTimeInterval(countryLookupRetrySec)
+                    } else {
+                        if !protonStableExitIP.isEmpty, protonStableExitIP != result.ip {
+                            // Never log the IP itself, only that the exit moved.
+                            logEvent("proton exit changed country=\(result.countryCode)")
                         }
+                        protonStableExitIP = result.ip
+                        if result.countryCode != currentCountryCode {
+                            currentCountryCode = result.countryCode
+                            currentCountryName = result.countryName
+                            countryChanged = true
+                            logEvent("country=\(result.countryCode)")
+                            if pendingPeekAt != nil {
+                                // A connect peek is waiting for this country: let the
+                                // flag refresh go first (this poll), then present the
+                                // peek on the refreshed, unchanged surfaces.
+                                pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
+                            }
+                        }
+                        nextCountryProbeAt = now.addingTimeInterval(protonExitRefreshIntervalSec)
                     }
-                    nextCountryProbeAt = now.addingTimeInterval(countryRefreshIntervalSec)
+                }
+            } else {
+                _ = protonResolver.takeResult()
+                if let result = countryResolver.takeResult() {
+                    if result.generation != countryGeneration {
+                        logEvent("stale exit lookup discarded generation=\(result.generation)")
+                    } else if result.code.isEmpty {
+                        nextCountryProbeAt = now.addingTimeInterval(countryLookupRetrySec)
+                    } else {
+                        if result.code != currentCountryCode {
+                            currentCountryCode = result.code
+                            currentCountryName = result.name
+                            countryChanged = true
+                            logEvent("country=\(result.code)")
+                            if pendingPeekAt != nil {
+                                // A connect peek is waiting for this country: let the
+                                // flag refresh go first (this poll), then present the
+                                // peek on the refreshed, unchanged surfaces.
+                                pendingPeekAt = min(pendingPeekAt ?? now, now.addingTimeInterval(peekCountryLeadSec))
+                            }
+                        }
+                        nextCountryProbeAt = now.addingTimeInterval(countryRefreshIntervalSec)
+                    }
                 }
             }
 
             if state.connected, let probeAt = nextCountryProbeAt, now >= probeAt {
                 if routedTunnelInterface() == nil {
                     nextCountryProbeAt = now.addingTimeInterval(0.5)
-                } else if countryResolver.request(generation: countryGeneration) {
+                } else if protonActive, protonResolver.request(generation: countryGeneration) {
+                    nextCountryProbeAt = nil
+                } else if !protonActive, countryResolver.request(generation: countryGeneration) {
                     nextCountryProbeAt = nil
                 }
             }
@@ -617,15 +665,14 @@ private enum Main {
             // Shared by both modes: present a scheduled peek via a delayed update
             // on unchanged surfaces (the only shape DynamicLake reliably honours).
             if let peekAt = pendingPeekAt, now >= peekAt {
-                let awaitingCountry = state.connected && currentCountryCode.isEmpty
-                let countryWaitExpired = peekScheduledAt.map { now.timeIntervalSince($0) >= peekCountryWaitSec } ?? true
-                if awaitingCountry && !countryWaitExpired {
-                    // Hold the peek until the country lookup resolves so it can
-                    // show the flag — but only up to peekCountryWaitSec.
+                if shouldHoldPeekForCountry(connected: state.connected, countryCode: currentCountryCode) {
+                    // Hold the peek until the country lookup resolves so the
+                    // presentation always includes the flag. No timeout: while
+                    // connected with an unknown country there is nothing
+                    // correct to present yet. Disconnects are never held.
                     pendingPeekAt = now.addingTimeInterval(peekCountryRecheckSec)
                 } else {
                     pendingPeekAt = nil
-                    peekScheduledAt = nil
                 }
                 if pendingPeekAt == nil, published {
                     // The capsule/notification from the create is now established,
@@ -677,7 +724,6 @@ private enum Main {
                             // block above presents it once the notification capsule
                             // is established (DynamicLake ignores peeks on creates).
                             pendingPeekAt = now.addingTimeInterval(peekDelaySec)
-                            peekScheduledAt = now
                         } else {
                             reconnect()
                         }
@@ -742,7 +788,6 @@ private enum Main {
                     dismissAt = nil
                     if baseSig != lastBaseSig {
                         pendingPeekAt = nil
-                        peekScheduledAt = nil
                         if published {
                             // Surface change only — the peek is scheduled separately,
                             // since presentSneakPeek on a surface-changing update is
@@ -758,7 +803,6 @@ private enum Main {
                                 reconnect()
                             } else {
                                 pendingPeekAt = now.addingTimeInterval(peekDelaySec)
-                                peekScheduledAt = now
                             }
                         } else if sendTracked(client, createPayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
                             published = true
@@ -768,7 +812,6 @@ private enum Main {
                             // on updates racing the create. While connected, the
                             // peek then also waits for the country (see above).
                             pendingPeekAt = now.addingTimeInterval(peekDelaySec)
-                            peekScheduledAt = now
                         }
                         lastBaseSig = baseSig
                         lastFullSig = sig
