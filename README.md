@@ -74,7 +74,7 @@ The test suite builds both architectures, checks the framed socket payload in th
 - **Rafael Reverberi** ([@rafaelreverberi](https://github.com/rafaelreverberi)) — ProtonVPN exit-country stabilization (1.1.6) and bundled flag artwork
 
 ## Version
-1.1.8
+1.1.9
 
 ## Changelog
 Only the latest release is listed here; the full version history lives in [CHANGELOG.md](CHANGELOG.md).
