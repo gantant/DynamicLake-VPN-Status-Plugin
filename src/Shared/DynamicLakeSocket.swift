@@ -132,7 +132,7 @@ public final class JSONSocketClient {
     }
 }
 
-public func runProcess(_ path: String, arguments: [String], timeout: TimeInterval = 5) -> (Data, Int32) {
+public func runProcess(_ path: String, arguments: [String], timeout: TimeInterval = 5, log: ((String) -> Void)? = nil) -> (Data, Int32) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: path)
     proc.arguments = arguments
@@ -140,10 +140,20 @@ public func runProcess(_ path: String, arguments: [String], timeout: TimeInterva
     let errPipe = Pipe()
     proc.standardOutput = outPipe
     proc.standardError = errPipe
+    if let log = log {
+        log("run: \(path) \(arguments.joined(separator: " "))")
+    }
     do {
         try proc.run()
     } catch {
         return (Data(), -1)
+    }
+    // Close the child's pipe ends on every path past a successful spawn —
+    // including the timeout/kill path — so a throw-free run can never leak
+    // descriptors into the poll loop.
+    defer {
+        outPipe.fileHandleForReading.closeFile()
+        errPipe.fileHandleForReading.closeFile()
     }
     let deadline = Date().addingTimeInterval(timeout)
     while proc.isRunning && Date() < deadline {
@@ -164,7 +174,5 @@ public func runProcess(_ path: String, arguments: [String], timeout: TimeInterva
     }
     let data = outPipe.fileHandleForReading.readDataToEndOfFile()
     _ = errPipe.fileHandleForReading.readDataToEndOfFile()
-    outPipe.fileHandleForReading.closeFile()
-    errPipe.fileHandleForReading.closeFile()
     return (data, proc.terminationStatus)
 }

@@ -2,6 +2,10 @@
 
 All notable changes to the VPN Status plugin. The latest release is also summarized in the [README](README.md).
 
+## 1.1.9
+
+Resource hygiene for shipping: a failed subprocess spawn no longer leaks its pipe file descriptors (all pipe closes now live in a `defer` in the shared process runner), and the poll loop backs off to 2s while disconnected (~230k → ~86k subprocess spawns/day idle), with the expensive `ifconfig -a` dump now only running when a utun interface actually owns the default route. Reconnect detection stays capped at ~2s — well under the connect peek's settle delay — so there is no visible behavior change.
+
 ## 1.1.8
 
 Log hygiene for shipping: the log can no longer grow unbounded. `vpn-status.log` now rotates at 256KB (keeping the most recent 64KB), and consecutive identical events collapse into one line with a repeat count instead of appending per occurrence. The ProtonVPN exit resolver's routine per-probe lines (`probe started`, `exit stable country=…`) no longer log in production — they fired on every 5s re-probe while connected (~34k lines/day); anomalous diagnostics (route mismatch, unstable probe pair, stale discards) still log, and tests opt back in to the routine lines. No behavior change to status detection, peeks, or flags.
