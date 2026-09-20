@@ -10,14 +10,15 @@ ZIP="../VPNStatus.dynamiclakeplugin.zip"
 SLICE_DIR=$(mktemp -d)
 trap 'rm -rf "$SLICE_DIR"' EXIT
 
-SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift VPNStatusPlugin.swift)
+SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift NEVPNWatcher.swift VPNStatusPlugin.swift)
+NE_FLAGS=(-framework NetworkExtension)
 
 echo "==> Compiling arm64 slice"
-swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \
+swiftc -parse-as-library -O -target arm64-apple-macosx14.0 "${NE_FLAGS[@]}" \
     -o "$SLICE_DIR/vpn-arm64" "${SOURCES[@]}"
 
 echo "==> Compiling x86_64 (Intel) slice"
-swiftc -parse-as-library -O -target x86_64-apple-macosx14.0 \
+swiftc -parse-as-library -O -target x86_64-apple-macosx14.0 "${NE_FLAGS[@]}" \
     -o "$SLICE_DIR/vpn-x86_64" "${SOURCES[@]}"
 
 echo "==> Merging universal binary (lipo)"

@@ -70,26 +70,41 @@ def main() -> None:
             connection, _ = server.accept()
             connection.settimeout(1)
             frames = []
+            seen_flag = False
+            seen_demote = False
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 try:
-                    frames.append(receive_frame(connection))
+                    frame = receive_frame(connection)
+                    frames.append(frame)
+                    if (
+                        frame.get("surfaces", {})
+                        .get("compactLiveActivity", {})
+                        .get("rightSlot", {})
+                        .get("source")
+                        == "inlineData"
+                    ):
+                        seen_flag = True
+                    if frame.get("requestID", "").startswith("demote-"):
+                        seen_demote = True
                 except (socket.timeout, TimeoutError):
                     continue
-                if any(
-                    frame.get("surfaces", {})
-                    .get("compactLiveActivity", {})
-                    .get("rightSlot", {})
-                    .get("source")
-                    == "inlineData"
-                    for frame in frames
-                ):
+                if seen_flag and seen_demote:
                     break
 
             assert frames[0]["type"] == "dismiss"
             assert any(frame.get("presentSneakPeek") == 2 for frame in frames)
             create = next(frame for frame in frames if frame["type"] == "create")
+            # Two-phase presentation: announces at notification priority, then a
+            # demote update returns the activity to the persistent profile.
+            # Size must NOT differ between phases: a size change re-lays-out the
+            # compact surface and visibly shifts the logo/flag a few pixels.
+            assert create["priority"] == "high"
             assert create["size"] == "small"
+            demote = next(frame for frame in frames if frame.get("requestID", "").startswith("demote-"))
+            assert demote["type"] == "update"
+            assert demote["priority"] == "low"
+            assert "size" not in demote
             assert set(create["surfaces"]) == {"compactLiveActivity", "sneakPeek", "extraLiveActivity"}
             compact = create["surfaces"]["compactLiveActivity"]
             extra = create["surfaces"]["extraLiveActivity"]

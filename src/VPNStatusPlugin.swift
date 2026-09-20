@@ -97,6 +97,15 @@ private let pollIntervalSec: TimeInterval = 0.75
 /// ~230k. Reconnect detection latency is capped at ~2s — well under the
 /// connect peek's own settle delay, so UX is unchanged.
 private let disconnectedPollIntervalSec: TimeInterval = 2.0
+/// While a fresh connection awaits its second sighting (the staleness hold),
+/// the loop runs at this cadence so connect detection completes in ~100ms
+/// instead of waiting out the idle interval.
+private let connectionConfirmIntervalSec: TimeInterval = 0.1
+/// While the NetworkExtension event stream drives the status, these bound how
+/// often its "connected" answer is verified against the system (a utun owning
+/// the default route / scutil agreement) — the stale-session self-defense.
+private let neSanityIntervalSec: TimeInterval = 30
+private let neCrossCheckIntervalSec: TimeInterval = 60
 /// DEBUG builds only: setting VPNSTATUS_LOG_SUBPROCESSES=1 logs every
 /// VPN-status subprocess call (they run hundreds of thousands of times per
 /// day, so this is off by default). The ifconfig dump additionally requires
@@ -119,17 +128,26 @@ private let countryRefreshIntervalSec: TimeInterval = 15
 private let sneakPeekPresentationSec: Double = 2
 /// DynamicLake only honours `presentSneakPeek` on updates, and swallows one sent
 /// in the same breath as the create — so the connect peek is presented via a
-/// short-delayed update, once the capsule is established.
-private let peekDelaySec: TimeInterval = 0.5
+/// short-delayed update, once the capsule is established. The delay only needs
+/// to exceed DynamicLake's create materialization time (single-digit ms); 150ms
+/// keeps a wide safety margin while making the peek feel instant.
+private let peekDelaySec: TimeInterval = 0.15
+/// Peeks scheduled after a *surface-changing* update (server switch while
+/// connected) need a slightly longer settle: DynamicLake is still applying
+/// the changed surfaces and swallows a peek frame arriving too soon after
+/// one — 0.15s works after a create but not here.
+private let peekAfterSurfaceUpdateSec: TimeInterval = 0.4
 /// On connect, the peek waits for the exit-country lookup so it always shows
 /// logo + country + flag in one presentation — it never peeks without the
 /// country while connected. Disconnect peeks are unaffected (no country).
 private let peekCountryRecheckSec: TimeInterval = 0.25
 /// Once the country arrives while a peek is pending, the flag refresh is sent
 /// first; the peek follows this much later as a pure presentation update.
-private let peekCountryLeadSec: TimeInterval = 0.3
+/// Ordering on the socket is already FIFO, so this only needs to cover
+/// DynamicLake's per-frame apply latency.
+private let peekCountryLeadSec: TimeInterval = 0.1
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.9"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.2.0"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -143,6 +161,12 @@ private struct VPNStatus {
     var serviceName: String?
     var serverAddress: String?
     var routedInterface: String?
+    /// Identifies the tunnel session itself (NetworkExtension path only: the
+    /// connection's start date). Server switches start a new session, so
+    /// including it in the connection key keeps switch detection working
+    /// even when the config-level server address never changes. The scutil
+    /// path keys on the live ServerAddress and leaves this nil.
+    var sessionID: String?
 }
 
 private struct ExitCountry {
@@ -299,7 +323,7 @@ private func serverAddress(for serviceName: String) -> String? {
 }
 
 private func getVPNStatus() -> VPNStatus {
-    let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil)
+    let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil, sessionID: nil)
     var connectingProvider: String?
     let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "list"], log: logVPNStatusCalls ? logEvent : nil)
     if let str = String(data: out, encoding: .utf8) {
@@ -316,7 +340,8 @@ private func getVPNStatus() -> VPNStatus {
                     protocol_: proto,
                     serviceName: serviceName,
                     serverAddress: serverAddress(for: serviceName),
-                    routedInterface: nil
+                    routedInterface: nil,
+                    sessionID: nil
                 )
             }
             // A service mid-handshake names the provider that owns the tunnel
@@ -350,13 +375,121 @@ private func getVPNStatus() -> VPNStatus {
                     protocol_: "WireGuard",
                     serviceName: nil,
                     serverAddress: nil,
-                    routedInterface: routedInterface
+                    routedInterface: routedInterface,
+                    sessionID: nil
                 )
             }
         }
     }
 
     return disconnected
+}
+
+/// Status resolution for the main loop: NetworkExtension snapshot first
+/// (event-driven, zero spawns), scutil polling as the automatic fallback.
+///
+/// NE is trusted only while it agrees with the system. While it reports a
+/// connected tunnel, two cheap periodic self-defense checks run (NE can
+/// otherwise keep reporting a stale session after a crash or a system-
+/// extension wedge — the same stale-state class the 1.1.7 flash fix
+/// addressed on the scutil side):
+///
+/// - sanity (every `neSanityIntervalSec`): a utun interface must actually
+///   own the default route (1 spawn per check);
+/// - cross-check (every `neCrossCheckIntervalSec`): scutil must agree that
+///   a session is up with the same service name (1 spawn per check).
+///
+/// Any contradiction marks NE unhealthy for 60s (the scutil path takes over
+/// completely) and logs it; the watcher self-heals after the epoch.
+private func resolveStatus(now: Date, lastNESanityAt: inout Date?, lastNECrossCheckAt: inout Date?) -> VPNStatus {
+    guard let neState = neStatusSnapshot() else { return getVPNStatus() }
+    guard neState.connected else {
+        // Not connected (or connecting) per NE. Trust it — this is the
+        // zero-spawn idle path — but run the scutil cross-check on the slow
+        // cadence so a wedged NE cannot mask a real session for long. On
+        // disagreement NE is marked unhealthy and scutil takes over.
+        let crossCheckDue = lastNECrossCheckAt == nil || now.timeIntervalSince(lastNECrossCheckAt!) >= neCrossCheckIntervalSec
+        if crossCheckDue {
+            lastNECrossCheckAt = now
+            let scutil = getVPNStatus()
+            if scutil.connected {
+                logEvent("ne reports disconnected but scutil disagrees; using scutil")
+                NEVPNWatcher.markUnhealthy()
+                return scutil
+            }
+        }
+        return neState
+    }
+
+    // NE says connected — verify the system agrees on the slow cadences.
+    let sanityDue = lastNESanityAt == nil || now.timeIntervalSince(lastNESanityAt!) >= neSanityIntervalSec
+    let crossCheckDue = lastNECrossCheckAt == nil || now.timeIntervalSince(lastNECrossCheckAt!) >= neCrossCheckIntervalSec
+    if sanityDue {
+        lastNESanityAt = now
+        if routedTunnelInterface() == nil {
+            logEvent("ne reports connected but no utun owns the default route; using scutil")
+            NEVPNWatcher.markUnhealthy()
+            return getVPNStatus()
+        }
+    }
+    if crossCheckDue {
+        lastNECrossCheckAt = now
+        let scutil = getVPNStatus()
+        let serviceMismatch = scutil.serviceName != nil && neState.serviceName != nil && scutil.serviceName != neState.serviceName
+        // State lie (scutil sees no session) or attribution lie (a different
+        // provider owns the session) => NE cannot be trusted; a mere server-
+        // address difference is cosmetic (profile-style configs can lag the
+        // live tunnel) and only logged.
+        let addressMismatch = scutil.serverAddress != nil && neState.serverAddress != nil && scutil.serverAddress != neState.serverAddress
+        if addressMismatch {
+            logEvent("ne server address differs from scutil; state still trusted")
+        }
+        if !scutil.connected || serviceMismatch {
+            logEvent("ne/scutil disagree on the connected session; using scutil")
+            NEVPNWatcher.markUnhealthy()
+            return scutil
+        }
+    }
+    return neState
+}
+
+/// Snapshot of the NE tunnels for Nord and Proton: a connected tunnel wins
+/// over a connecting one; nothing recognized -> nil (caller falls back to
+/// scutil, which also covers non-NE providers like the WireGuard app).
+private func neStatusSnapshot() -> VPNStatus? {
+    let nord = NEVPNWatcher.bestStatus(target: .nord)
+    let proton = NEVPNWatcher.bestStatus(target: .proton)
+    for s in [nord, proton].compactMap({ $0 }) where s.connected {
+        return neStatusToVPNStatus(s)
+    }
+    if let connecting = [nord, proton].compactMap({ $0 }).first(where: { $0.connecting }) {
+        // Mid-handshake: report the provider as connecting-but-not-connected
+        // (mirrors the scutil Connecting attribution the flash fix relies on)
+        // and let the loop's staleness hold gate the peek until connected.
+        var s = neStatusToVPNStatus(connecting)
+        s.connected = false
+        return s
+    }
+    if nord != nil || proton != nil {
+        // Both known tunnels exist but none is up: authoritative disconnected
+        // straight from the event mirror — no spawns at all on this path.
+        var s = neStatusToVPNStatus(nord ?? proton!)
+        s.connected = false
+        return s
+    }
+    return nil
+}
+
+private func neStatusToVPNStatus(_ s: NEVPNWatcher.Status) -> VPNStatus {
+    VPNStatus(
+        connected: s.connected,
+        provider: s.provider,
+        protocol_: nil,
+        serviceName: s.serviceName,
+        serverAddress: s.serverAddress,
+        routedInterface: nil,
+        sessionID: s.startDate.map { String(Int64($0.timeIntervalSince1970 * 1000)) }
+    )
 }
 
 /// Last-resort provider attribution for the routed-utun fallback. Both
@@ -445,20 +578,46 @@ private func statusSneakPeek(connected: Bool, provider: String?, countryCode: St
 }
 
 private func createPayload(connected: Bool, provider: String?, countryCode: String, countryName: String = "") -> [String: Any] {
+    makeCreatePayload(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName, priority: "low", size: "small")
+}
+
+/// Connect creates go out at notification priority so the connect Sneak Peek
+/// presents like a banner; after the peek's presentation window an update
+/// (see demotePayload) returns the activity to the persistent profile.
+/// Deliberately the SAME size as the resting capsule: changing size between
+/// the two phases re-lays-out the compact surface and visibly shifts the
+/// logo/flag by a few pixels — only the priority may differ.
+private func connectCreatePayload(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
+    makeCreatePayload(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName, priority: "high", size: "small")
+}
+
+private func makeCreatePayload(connected: Bool, provider: String?, countryCode: String, countryName: String, priority: String, size: String) -> [String: Any] {
     [
         "schemaVersion": schemaVersion,
         "requestID": "create-vpn",
         "type": "create",
         "activityID": activityID,
         "title": pluginName,
-        "priority": "low",
-        "size": "small",
+        "priority": priority,
+        "size": size,
         "surfaces": [
             "compactLiveActivity": compactSurface(connected: connected, provider: provider, countryCode: countryCode),
             "sneakPeek": statusSneakPeek(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName),
             "extraLiveActivity": extraLiveActivitySurface(connected: connected, provider: provider)
         ] as [String: Any]
     ]
+}
+
+/// Drops the activity back to the persistent profile after the connect peek.
+/// Only the priority changes (size stays untouched) so the capsule geometry
+/// never shifts. Whether DynamicLake re-evaluates priority on updates is
+/// undocumented; when it ignores the field this frame is a harmless refresh.
+private func demotePayload(connected: Bool, provider: String?, countryCode: String, countryName: String) -> [String: Any] {
+    updateSequence += 1
+    var payload = peekUpdatePayload(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName, presentPeek: false)
+    payload["priority"] = "low"
+    payload["requestID"] = "demote-\(updateSequence)"
+    return payload
 }
 
 private var updateSequence: UInt64 = 0
@@ -596,6 +755,12 @@ private enum Main {
         var lastBaseSig = ""
         var lastFullSig = ""
         var pendingPeekAt: Date?
+        /// False while the published activity sits at connect (notification)
+        /// priority and still owes its demote-to-persistent update; see
+        /// connectCreatePayload / demotePayload. The demote itself is held
+        /// until the peek's presentation window has fully played out.
+        var activityDemoted = true
+        var demoteAt: Date?
         var prevConnected: Bool?
         var lastMode: Bool?
         var dismissAt: Date?
@@ -611,6 +776,28 @@ private enum Main {
         var nextCountryProbeAt: Date?
         var lastReassertAt: Date?
         let countryResolver = ExitCountryResolver()
+        // NetworkExtension event source: loaded once before the loop; the
+        // signal fires on every NEVPNStatusDidChange so transitions interrupt
+        // the loop's wait immediately (connect/disconnect latency is event
+        // driven, not poll driven). NE failing to load here just means the
+        // scutil path below keeps driving everything, as before 1.2.0.
+        let neSignal = DispatchSemaphore(value: 0)
+        NEVPNWatcher.onStatusChange = { neSignal.signal() }
+        let neLoaded: Bool = {
+            let done = DispatchSemaphore(value: 0)
+            var ok = false
+            NEVPNWatcher.load { neLoaded in
+                ok = neLoaded
+                done.signal()
+            }
+            done.wait()
+            return ok
+        }()
+        if neLoaded {
+            logEvent("network extension status source active")
+        }
+        var lastNESanityAt: Date?
+        var lastNECrossCheckAt: Date?
         // Proton-only stabilized exit resolver. NordVPN and every other
         // provider keep using `countryResolver` above with unchanged behavior.
         let protonResolver = ProtonExitResolver(logger: logEvent)
@@ -627,7 +814,7 @@ private enum Main {
 
         func connectionKey(for vpn: VPNStatus) -> String {
             if let service = vpn.serviceName {
-                return "service|\(service)|\(vpn.serverAddress ?? "")"
+                return "service|\(service)|\(vpn.serverAddress ?? "")|\(vpn.sessionID ?? "")"
             }
             return "route|\(vpn.provider ?? "")|\(vpn.routedInterface ?? "")"
         }
@@ -648,6 +835,8 @@ private enum Main {
                 published = false
                 dismissAt = nil
                 pendingPeekAt = nil
+                demoteAt = nil
+                activityDemoted = true
                 // Reset the surfaces signatures too, or the fresh mode's first
                 // capsule/notification could be skipped as "unchanged".
                 lastBaseSig = ""
@@ -658,7 +847,7 @@ private enum Main {
             }
 
             let now = Date()
-            let vpn = getVPNStatus()
+            let vpn = resolveStatus(now: now, lastNESanityAt: &lastNESanityAt, lastNECrossCheckAt: &lastNECrossCheckAt)
 
             // macOS keeps the previous session marked Connected for a poll or two
             // while a new VPN (e.g. NordVPN) finishes its handshake, and during the
@@ -862,6 +1051,14 @@ private enum Main {
                         reconnect()
                     } else {
                         logEvent("sneak peek presented")
+                        // Two-phase presentation: if the activity was created at
+                        // notification priority for this connect, schedule the
+                        // drop back to the persistent profile for when the peek's
+                        // presentation window has fully closed — dropping earlier
+                        // visibly interrupts the expanding animation.
+                        if !activityDemoted, demoteAt == nil {
+                            demoteAt = now.addingTimeInterval(sneakPeekPresentationSec + 0.25)
+                        }
                         // Sync the signatures so nothing re-sends these surfaces
                         // while the peek is on screen.
                         lastBaseSig = baseSig
@@ -873,6 +1070,26 @@ private enum Main {
                             dismissAt = max(deadline, now.addingTimeInterval(sneakPeekPresentationSec + 0.25))
                         }
                     }
+                }
+            }
+
+            // Two-phase presentation, phase 2: after the peek's presentation
+            // window has fully played out, drop the activity back to the
+            // persistent profile so it settles into the ELA row. Runs before
+            // the mode branches so notify-mode dismissal cannot outrun it.
+            if let demoteDeadline = demoteAt, now >= demoteDeadline, published {
+                if sendTracked(
+                    client,
+                    demotePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                    "demote"
+                ) {
+                    activityDemoted = true
+                    demoteAt = nil
+                } else {
+                    published = false
+                    lastBaseSig = ""
+                    lastFullSig = ""
+                    reconnect()
                 }
             }
 
@@ -892,6 +1109,8 @@ private enum Main {
                     if let n = transition {
                         if sendTracked(client, notifyPayload(connected: n.connected, provider: n.provider, countryCode: n.countryCode, countryName: n.countryName), "notify create") {
                             published = true
+                            // The notification dismisses itself; no demote owed.
+                            activityDemoted = true
                             dismissAt = now.addingTimeInterval(notificationDurationSec)
                             // Same delayed peek as persistent mode: the shared peek
                             // block above presents it once the notification capsule
@@ -918,12 +1137,38 @@ private enum Main {
                 }
 
                 if published, let deadline = dismissAt, now >= deadline {
-                    if !sendTracked(client, dismissPayload(), "notify dismiss") {
-                        logEvent("notify dismiss failed; dropping state")
+                    if demoteAt != nil || !activityDemoted {
+                        // The priority announcement is still owed: demote first,
+                        // then dismiss on the next cycle rather than tearing the
+                        // activity down mid-transition.
+                        if sendTracked(
+                            client,
+                            demotePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName),
+                            "demote before dismiss"
+                        ) {
+                            activityDemoted = true
+                            demoteAt = nil
+                            dismissAt = now.addingTimeInterval(0.3)
+                        } else {
+                            // Dead socket: postponing the dismiss would just
+                            // retry into the void — drop state so the next
+                            // poll rebuilds, like every other send failure.
+                            published = false
+                            lastBaseSig = ""
+                            lastFullSig = ""
+                            reconnect()
+                        }
+                    } else if sendTracked(client, dismissPayload(), "notify dismiss") {
+                        published = false
+                        dismissAt = nil
+                        logEvent("dismiss (notification expired)")
+                    } else {
+                        published = false
+                        dismissAt = nil
+                        lastBaseSig = ""
+                        lastFullSig = ""
+                        reconnect()
                     }
-                    published = false
-                    dismissAt = nil
-                    logEvent("dismiss (notification expired)")
                 }
             } else {
                 prevConnected = nil
@@ -931,9 +1176,18 @@ private enum Main {
 
                 if !state.connected && !persistDisconnected {
                     if published, dismissAt == nil {
+                        // Two-phase presentation for disconnects too: promote the
+                        // capsule to notification priority so the peek presents
+                        // like a banner, then demote before it dismisses.
+                        var payload = peekUpdatePayload(connected: false, provider: nil, countryCode: "", countryName: "")
+                        if activityDemoted {
+                            payload["priority"] = "high"
+                            payload["requestID"] = "promote-\(updateSequence)"
+                            activityDemoted = false
+                        }
                         if !sendTracked(
                             client,
-                            peekUpdatePayload(connected: false, provider: nil, countryCode: "", countryName: ""),
+                            payload,
                             "disconnect peek"
                         ) {
                             // The socket died mid-disconnect: drop the published
@@ -944,6 +1198,7 @@ private enum Main {
                             lastFullSig = ""
                             reconnect()
                         } else {
+                            demoteAt = now.addingTimeInterval(sneakPeekPresentationSec + 0.25)
                             dismissAt = now.addingTimeInterval(notificationDurationSec)
                             lastBaseSig = baseSig
                             lastFullSig = sig
@@ -965,9 +1220,20 @@ private enum Main {
                             // Surface change only — the peek is scheduled separately,
                             // since presentSneakPeek on a surface-changing update is
                             // ignored by DynamicLake.
+                            var payload = peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false)
+                            // A server/location switch while connected announces like
+                            // a connect: promote to notification priority, refresh the
+                            // surfaces (the flag already reflects the picked location),
+                            // then present the peek as a pure presentation update and
+                            // demote once its window closes (shared peek block below).
+                            if state.connected {
+                                payload["priority"] = "high"
+                                payload["requestID"] = "promote-\(updateSequence)"
+                                activityDemoted = false
+                            }
                             if !sendTracked(
                                 client,
-                                peekUpdatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName, presentPeek: false),
+                                payload,
                                 "surface update"
                             ) {
                                 published = false
@@ -975,10 +1241,13 @@ private enum Main {
                                 lastFullSig = ""
                                 reconnect()
                             } else {
-                                pendingPeekAt = now.addingTimeInterval(peekDelaySec)
+                                pendingPeekAt = now.addingTimeInterval(peekAfterSurfaceUpdateSec)
                             }
-                        } else if sendTracked(client, createPayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
+                        } else if sendTracked(client, connectCreatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
                             published = true
+                            // Connect and disconnect announcements both present at
+                            // notification priority and demote after their peek.
+                            activityDemoted = false
                             lastReassertAt = now
                             // Present the peek shortly after the capsule appears:
                             // DynamicLake ignores presentSneakPeek on creates and
@@ -1025,9 +1294,25 @@ private enum Main {
 
             lastMode = notifyOnChange
             let active = published && notifyOnChange
-            // Cadence: notify-active fast, connected normal, disconnected idle.
-            let interval = active ? notificationPollIntervalSec : (state.connected ? pollIntervalSec : disconnectedPollIntervalSec)
-            Thread.sleep(forTimeInterval: interval)
+            // Cadence: notify-active fast, connect-confirm fastest (the
+            // staleness hold needs a quick second sighting), connected normal,
+            // disconnected idle. The NE signal interrupts the wait on any
+            // tunnel status change, so transitions are event-driven while all
+            // the bounds above stay polls. The wait runs in slices that pump
+            // the main RunLoop: NE may deliver completions and notifications
+            // on the main queue, which nothing else drains (the loop thread IS
+            // the main thread).
+            let awaitingConnectionConfirm = vpn.connected && !state.connected
+            let interval = active ? notificationPollIntervalSec
+                : awaitingConnectionConfirm ? connectionConfirmIntervalSec
+                : state.connected ? pollIntervalSec
+                : disconnectedPollIntervalSec
+            let waitDeadline = Date().addingTimeInterval(interval)
+            waitLoop: while running {
+                if neSignal.wait(timeout: .now() + 0.05) == .success { break waitLoop }
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+                if Date() >= waitDeadline { break waitLoop }
+            }
         }
 
         if published {
