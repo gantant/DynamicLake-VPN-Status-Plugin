@@ -26,7 +26,9 @@ private var suppressedLogRepeats = 0
 /// Called from the main loop and from resolver completion queues, so the lock
 /// keeps the suppression state and the writes consistent across threads.
 /// Public IP addresses are never logged.
-private func logEvent(_ message: String) {
+/// Internal (not private) so the shared runProcess helper can log its
+/// subprocess calls when subprocess diagnostics are enabled.
+func logEvent(_ message: String) {
     logLock.lock()
     defer { logLock.unlock() }
 
@@ -89,6 +91,22 @@ private func trimLogIfNeeded() {
 private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
 private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
 private let pollIntervalSec: TimeInterval = 0.75
+/// While disconnected nothing changes until the user acts, so the poll backs
+/// off: idle disconnected polling costs 2 spawns/cycle (scutil list + utun
+/// check) vs up to 5/cycle connected, so 2s idle ≈ 86k spawns/day instead of
+/// ~230k. Reconnect detection latency is capped at ~2s — well under the
+/// connect peek's own settle delay, so UX is unchanged.
+private let disconnectedPollIntervalSec: TimeInterval = 2.0
+/// DEBUG builds only: setting VPNSTATUS_LOG_SUBPROCESSES=1 logs every
+/// VPN-status subprocess call (they run hundreds of thousands of times per
+/// day, so this is off by default). The ifconfig dump additionally requires
+/// VPNSTATUS_LOG_SUBPROCESSES=force-ifconfig to run at all, so the
+/// conditional-utun behavior can be compared against the old path.
+#if DEBUG
+private let logVPNStatusCalls = ProcessInfo.processInfo.environment["VPNSTATUS_LOG_SUBPROCESSES"] == "1"
+#else
+private let logVPNStatusCalls = false
+#endif
 private let notificationDurationSec: TimeInterval = 4
 private let notificationPollIntervalSec: TimeInterval = 0.25
 private let geoLookupTimeoutSec: TimeInterval = 2
@@ -111,7 +129,7 @@ private let peekCountryRecheckSec: TimeInterval = 0.25
 /// first; the peek follows this much later as a pure presentation update.
 private let peekCountryLeadSec: TimeInterval = 0.3
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.8"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.1.9"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -269,7 +287,7 @@ private func routedTunnelInterface() -> String? {
 }
 
 private func serverAddress(for serviceName: String) -> String? {
-    let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "status", serviceName])
+    let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "status", serviceName], log: logVPNStatusCalls ? logEvent : nil)
     guard let str = String(data: out, encoding: .utf8) else { return nil }
     for line in str.components(separatedBy: "\n") {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -283,7 +301,7 @@ private func serverAddress(for serviceName: String) -> String? {
 private func getVPNStatus() -> VPNStatus {
     let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil)
     var connectingProvider: String?
-    let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "list"])
+    let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "list"], log: logVPNStatusCalls ? logEvent : nil)
     if let str = String(data: out, encoding: .utf8) {
         for line in str.components(separatedBy: "\n") {
             if line.contains("(Connected)") {
@@ -312,23 +330,29 @@ private func getVPNStatus() -> VPNStatus {
     }
 
     guard let routedInterface = routedTunnelInterface() else { return disconnected }
-    let (ifData, _) = runProcess("/sbin/ifconfig", arguments: ["-a"], timeout: 3)
-    let ifStr = String(data: ifData, encoding: .utf8) ?? ""
-    var onUtun = false
-    for line in ifStr.components(separatedBy: "\n") {
-        if line.first?.isLetter == true {
-            onUtun = line.hasPrefix(routedInterface + ":")
-        }
-        if onUtun, hasRoutableAddress(line) {
-            let provider = connectingProvider ?? detectProviderFast() ?? "VPN"
-            return VPNStatus(
-                connected: true,
-                provider: provider,
-                protocol_: "WireGuard",
-                serviceName: nil,
-                serverAddress: nil,
-                routedInterface: routedInterface
-            )
+    // ifconfig -a dumps every interface (tens of KB) and costs real time to
+    // spawn — the most expensive call in the poll loop. Only run it when a
+    // utun interface actually owns the default route; with scutil managing the
+    // session (Proton/Nord normal path) it never fires.
+    if logVPNStatusCalls || ProcessInfo.processInfo.environment["VPNSTATUS_LOG_SUBPROCESSES"] == "force-ifconfig" {
+        let (ifData, _) = runProcess("/sbin/ifconfig", arguments: ["-a"], timeout: 3, log: logVPNStatusCalls ? logEvent : nil)
+        let ifStr = String(data: ifData, encoding: .utf8) ?? ""
+        var onUtun = false
+        for line in ifStr.components(separatedBy: "\n") {
+            if line.first?.isLetter == true {
+                onUtun = line.hasPrefix(routedInterface + ":")
+            }
+            if onUtun, hasRoutableAddress(line) {
+                let provider = connectingProvider ?? detectProviderFast() ?? "VPN"
+                return VPNStatus(
+                    connected: true,
+                    provider: provider,
+                    protocol_: "WireGuard",
+                    serviceName: nil,
+                    serverAddress: nil,
+                    routedInterface: routedInterface
+                )
+            }
         }
     }
 
@@ -1001,7 +1025,9 @@ private enum Main {
 
             lastMode = notifyOnChange
             let active = published && notifyOnChange
-            Thread.sleep(forTimeInterval: active ? notificationPollIntervalSec : pollIntervalSec)
+            // Cadence: notify-active fast, connected normal, disconnected idle.
+            let interval = active ? notificationPollIntervalSec : (state.connected ? pollIntervalSec : disconnectedPollIntervalSec)
+            Thread.sleep(forTimeInterval: interval)
         }
 
         if published {
