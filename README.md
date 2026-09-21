@@ -1,17 +1,19 @@
 # VPN Status Plugin for DynamicLake
 
 ## Overview
-A DynamicLake JSON plugin that displays ProtonVPN or NordVPN connection status in the MacBook notch. It is optimized for ProtonVPN transitions and Quick Connect, with a compact provider icon and a consistently rendered country-flag badge.
+A DynamicLake JSON plugin that displays ProtonVPN or NordVPN connection status in the MacBook notch. Status is event-driven — the plugin hears about tunnel changes from macOS directly instead of polling — with automatic fallbacks to the classic polling path, a compact provider icon, a consistently rendered country-flag badge, and banner-style Sneak Peek announcements for every connection change.
 
 ## Features
-- Detects provider and uses matching logo (NordVPN and ProtonVPN only for now, more to come later)
-- Prioritizes ProtonVPN's NetworkExtension service and detects changes in under a second
-- Uses routed-traffic validation for the utun fallback, avoiding false "connected" states from Proton's idle tunnel interface
-- Status indicator
-- Optional notify-on-change mode (see Settings below)
+- Detects the provider and shows the matching logo (NordVPN and ProtonVPN for now, more to come later)
+- Event-driven status: watches tunnels through macOS's NetworkExtension framework, so connect, disconnect, and server-switch transitions reach the notch in milliseconds, and an idle-disconnected machine costs essentially nothing
+- Self-defending: while the event source is active, slow cross-checks verify it against the routing table and the system's own connection list; any contradiction hands control back to polling until it proves healthy again
+- The polling fallback is complete: VPNs that don't use NetworkExtension (like the WireGuard app) keep working, and routed-traffic validation avoids false "connected" states from idle tunnel interfaces
+- Banner announcements: connect, disconnect, and server switches present at notification priority so the Sneak Peek pops, then settle back into the extra live activity row
+- Status indicator in the notch (persistent mode) or brief self-dismissing notifications (notify mode)
 - Country is resolved asynchronously from the actual VPN exit through two HTTPS-only, no-key fallbacks (`ipinfo.io` and Mullvad's connection check). A route guard prevents lookups during tunnel transitions, and no public IP address is stored or logged. NordVPN's selected location comes from the server identity first — hostname label, or station-IP match against a hardcoded table of virtual-location pools — which is what keeps virtual locations (e.g. Armenia) showing the picked flag instead of the physical host country; the geo lookup is the fallback.
 - Smaller 4:3 flag artwork is centered inside a transparent square canvas before being sent through DynamicLake's inline PNG image path. DynamicLake can keep its square image slot while rectangular flags retain their natural visible shape and spacing. It uses no emoji glyph and makes no network request for artwork; an emoji is used only as a last-resort fallback if the local asset cannot be read.
 - Self-healing persistent activity: re-asserts the live activity every 30s and recovers the socket connection, so the status returns on its own after sleep/wake even if DynamicLake dropped it
+- Sleep-aware: the plugin watches macOS sleep/wake directly and re-verifies everything the moment the Mac wakes, so a VPN that died during sleep leaves the notch right away
 
 ## Requirements
 - macOS with DynamicLake or DynamicLake Playground
@@ -40,17 +42,9 @@ VPNStatus.dynamiclakeplugin/
 ## Development
 ### Build from Source
 ```bash
-cd src
-swiftc -parse-as-library -O -target arm64-apple-macosx14.0 -o /tmp/vpn-arm64 Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift VPNStatusPlugin.swift
-swiftc -parse-as-library -O -target x86_64-apple-macosx14.0 -o /tmp/vpn-x86_64 Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift VPNStatusPlugin.swift
-lipo -create -output ../VPNStatus.dynamiclakeplugin/vpn-status /tmp/vpn-arm64 /tmp/vpn-x86_64
-rm /tmp/vpn-arm64 /tmp/vpn-x86_64
+./src/build.sh
 ```
-
-### Package for Submission
-```bash
-ditto -c -k --keepParent VPNStatus.dynamiclakeplugin VPNStatus.dynamiclakeplugin.zip
-```
+Compiles both architectures (frameworks included), merges the universal binary with `lipo`, and repackages `VPNStatus.dynamiclakeplugin.zip`.
 
 ### Tests
 
@@ -58,13 +52,13 @@ ditto -c -k --keepParent VPNStatus.dynamiclakeplugin VPNStatus.dynamiclakeplugin
 ./tests/run.sh
 ```
 
-The test suite builds both architectures, checks the framed socket payload in the current ProtonVPN state, guards against the idle-utun false positive when disconnected, and verifies that the bundled country flag is a valid PNG delivered through DynamicLake's inline-image payload when connected.
+Six suites, no network access required: a runtime test that drives the real binary over the framed socket and pins the announcement contract (high-priority create, low-priority demote), a flag-badge smoke test against the bundled artwork, ProtonVPN exit-country stabilization, NordVPN server/virtual-location resolution, NetworkExtension status mapping, and default-route tunnel detection mapping.
 
 ## Settings
-- `notifyOnChange` (switch, default off): **OFF (default):** a persistent small live activity stays in the notch while connected. A brief Sneak Peek is actively presented on every connection, country/server, and disconnection change; after disconnect the capsule remains visible for about four seconds before dismissal. **ON:** no persistent activity; the same brief notifications appear on changes and dismiss themselves after about four seconds. To test: enable it, then connect or disconnect your VPN.
+- `notifyOnChange` (switch, default off): **OFF (default):** a persistent small live activity stays in the notch while connected. A Sneak Peek is actively presented at notification priority on every connection, disconnection, and server/country change, then the capsule settles back into the extra live activity row; after disconnect the capsule remains visible for about four seconds before dismissal. **ON:** no persistent activity; the same banner-style notifications appear on changes and dismiss themselves after about four seconds. To test: enable it, then connect or disconnect your VPN.
 - `persistOnDisconnect` (switch, default off, persistent mode only): when enabled, the live activity stays in the notch even while the VPN is off (shows a red disconnected icon). When disabled, turning the VPN off dismisses the activity.
 - The automatic peek (`presentSneakPeek`) only fires when DynamicLake advertises the `presentSneakPeek` protocol feature (see `DYNAMICLAKE_PLUGIN_FEATURES` in the startup log); otherwise the same update is sent without the field and the peek simply shows on hover instead.
-- Debug events (mode switches, notification creates/dismisses, send errors) are written to `~/Library/Logs/vpn-status.log`.
+- Debug events (startup, transitions, announcements, send errors, fallback contradictions) are written to `~/Library/Logs/vpn-status.log`.
 
 ## Identifier
 `com.nebulark.vpn-status`
