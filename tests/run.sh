@@ -9,7 +9,8 @@ TEST_BINARY=$(mktemp -t vpn-flag-smoke)
 PROTON_TEST_BINARY=$(mktemp -t vpn-proton-exit-tests)
 NORD_TEST_BINARY=$(mktemp -t vpn-nord-location-tests)
 NE_TEST_BINARY=$(mktemp -t vpn-ne-watcher-tests)
-trap 'rm -f "$TEST_BINARY" "$PROTON_TEST_BINARY" "$NORD_TEST_BINARY" "$NE_TEST_BINARY"' EXIT
+PATH_TEST_BINARY=$(mktemp -t vpn-path-watcher-tests)
+trap 'rm -f "$TEST_BINARY" "$PROTON_TEST_BINARY" "$NORD_TEST_BINARY" "$NE_TEST_BINARY" "$PATH_TEST_BINARY"' EXIT
 swiftc -parse-as-library -O -target "$(uname -m)-apple-macosx14.0" \
     -o "$TEST_BINARY" src/CountryFlagAsset.swift tests/FlagBadgeSmoke.swift
 DYNAMICLAKE_PLUGIN_PACKAGE_PATH="$PWD/src" "$TEST_BINARY"
@@ -25,3 +26,7 @@ swiftc -O -target "$(uname -m)-apple-macosx14.0" \
 swiftc -O -target "$(uname -m)-apple-macosx14.0" \
     -o "$NE_TEST_BINARY" src/NEVPNWatcher.swift tests/NEVPNWatcherTests.swift
 "$NE_TEST_BINARY"
+
+swiftc -O -framework Network -target "$(uname -m)-apple-macosx14.0" \
+    -o "$PATH_TEST_BINARY" src/Shared/DynamicLakeSocket.swift src/PathWatcher.swift tests/PathWatcherTests.swift
+"$PATH_TEST_BINARY"
