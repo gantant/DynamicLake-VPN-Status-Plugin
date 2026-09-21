@@ -21,6 +21,15 @@ import Network
 /// permanently degrades the mirror to spawn-only for the process lifetime.
 public enum PathWatcher {
 
+    /// Called on the monitor's private queue after every pushed path update.
+    /// Set before `start` so early pushes are not missed; the plugin uses it
+    /// to wake its wait loop so route flips apply instantly.
+    public static var onPathChange: (() -> Void)?
+    /// Called once when a fresh mirror is proven wrong by the route table
+    /// and the watcher degrades to spawn-only (diagnostics; never fires
+    /// again for the process lifetime).
+    public static var onDegrade: (() -> Void)?
+
     private static let lock = NSLock()
     private static var monitor: NWPathMonitor?
     private static var mirrorResolved = false
@@ -51,6 +60,7 @@ public enum PathWatcher {
             mirrorResolved = true
             lastUpdateAt = Date()
             lock.unlock()
+            onPathChange?()
         }
         m.start(queue: DispatchQueue(label: "vpn-status.path-monitor", qos: .utility))
     }
@@ -110,7 +120,7 @@ public enum PathWatcher {
     /// Force-verified answer for decisions that would tear down the
     /// NetworkExtension event source: always consults the real route table.
     /// A fresh mirror contradicted by the table is degraded permanently
-    /// (logged by the caller).
+    /// (announced via `onDegrade`, once).
     @discardableResult
     public static func verifiedTunnelInterface() -> String? {
         lock.lock()
@@ -126,26 +136,35 @@ public enum PathWatcher {
         lock.unlock()
         let spawn = spawnRouteTunnel()
         if wasResolved, wasFresh, spawn != mirrorValue {
+            var announce = false
             lock.lock()
-            degraded = true
+            if !degraded {
+                degraded = true
+                announce = true
+            }
             lock.unlock()
+            if announce { onDegrade?() }
         }
         return spawn
     }
 
+    /// One route lookup. A successfully parsed answer seeds the mirror
+    /// symmetrically with pushes (tunnel or no-tunnel), so fallback reads
+    /// never leave a stale tunnel behind; the mirror then serves until the
+    /// next push or the staleness limit.
     private static func spawnRouteTunnel() -> String? {
         let (data, status) = runProcess("/sbin/route", arguments: ["-n", "get", "1.1.1.1"], timeout: 1)
         guard status == 0,
               let output = String(data: data, encoding: .utf8),
-              let iface = routedInterface(fromRouteOutput: output),
-              isTunnelInterface(iface) else { return nil }
+              let iface = routedInterface(fromRouteOutput: output) else { return nil }
+        let tunnel = isTunnelInterface(iface) ? iface : nil
         lock.lock()
         if !degraded {
-            mirroredTunnel = iface
+            mirroredTunnel = tunnel
             mirrorResolved = true
             lastUpdateAt = Date()
         }
         lock.unlock()
-        return iface
+        return tunnel
     }
 }

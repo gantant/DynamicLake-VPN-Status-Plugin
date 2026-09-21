@@ -787,6 +787,11 @@ private enum Main {
         // apply immediately; sleep/wake also signals to re-verify right away.
         let statusSignal = DispatchSemaphore(value: 0)
         NEVPNWatcher.onStatusChange = { statusSignal.signal() }
+        // Route flips wake the loop too, so path-driven surface changes apply
+        // immediately even from the idle backoff; a mirror degradation is a
+        // one-time capability downgrade worth a log line.
+        PathWatcher.onPathChange = { statusSignal.signal() }
+        PathWatcher.onDegrade = { logEvent("path monitor contradicted route table; degraded to spawn-only") }
         PathWatcher.start()
         let neLoaded: Bool = {
             let done = DispatchSemaphore(value: 0)
