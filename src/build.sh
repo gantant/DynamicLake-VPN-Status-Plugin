@@ -10,8 +10,8 @@ ZIP="../VPNStatus.dynamiclakeplugin.zip"
 SLICE_DIR=$(mktemp -d)
 trap 'rm -rf "$SLICE_DIR"' EXIT
 
-SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift NEVPNWatcher.swift VPNStatusPlugin.swift)
-NE_FLAGS=(-framework NetworkExtension)
+SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift NEVPNWatcher.swift PathWatcher.swift VPNStatusPlugin.swift)
+NE_FLAGS=(-framework NetworkExtension -framework Network -framework AppKit)
 
 echo "==> Compiling arm64 slice"
 swiftc -parse-as-library -O -target arm64-apple-macosx14.0 "${NE_FLAGS[@]}" \

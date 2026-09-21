@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 private let schemaVersion = 1
@@ -147,7 +148,7 @@ private let peekCountryRecheckSec: TimeInterval = 0.25
 /// DynamicLake's per-frame apply latency.
 private let peekCountryLeadSec: TimeInterval = 0.1
 /// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.2.0"
+private let pluginUserAgent = "VPNStatus-DynamicLake/1.2.1"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
@@ -354,7 +355,7 @@ private func getVPNStatus() -> VPNStatus {
         }
     }
 
-    guard let routedInterface = routedTunnelInterface() else { return disconnected }
+    guard let routedInterface = PathWatcher.routedTunnelInterface() else { return disconnected }
     // ifconfig -a dumps every interface (tens of KB) and costs real time to
     // spawn — the most expensive call in the poll loop. Only run it when a
     // utun interface actually owns the default route; with scutil managing the
@@ -426,7 +427,7 @@ private func resolveStatus(now: Date, lastNESanityAt: inout Date?, lastNECrossCh
     let crossCheckDue = lastNECrossCheckAt == nil || now.timeIntervalSince(lastNECrossCheckAt!) >= neCrossCheckIntervalSec
     if sanityDue {
         lastNESanityAt = now
-        if routedTunnelInterface() == nil {
+        if PathWatcher.verifiedTunnelInterface() == nil {
             logEvent("ne reports connected but no utun owns the default route; using scutil")
             NEVPNWatcher.markUnhealthy()
             return getVPNStatus()
@@ -781,8 +782,12 @@ private enum Main {
         // the loop's wait immediately (connect/disconnect latency is event
         // driven, not poll driven). NE failing to load here just means the
         // scutil path below keeps driving everything, as before 1.2.0.
-        let neSignal = DispatchSemaphore(value: 0)
-        NEVPNWatcher.onStatusChange = { neSignal.signal() }
+        // Combined wake-up signal: NEVPNStatusDidChange and default-path
+        // changes (PathWatcher) both interrupt the loop's wait so transitions
+        // apply immediately; sleep/wake also signals to re-verify right away.
+        let statusSignal = DispatchSemaphore(value: 0)
+        NEVPNWatcher.onStatusChange = { statusSignal.signal() }
+        PathWatcher.start()
         let neLoaded: Bool = {
             let done = DispatchSemaphore(value: 0)
             var ok = false
@@ -798,6 +803,28 @@ private enum Main {
         }
         var lastNESanityAt: Date?
         var lastNECrossCheckAt: Date?
+        // Sleep/wake: re-verify status right after waking instead of trusting
+        // state that may predate the sleep (the stale-session bug class).
+        // willSleep drops the wake marker so nothing re-verifies while asleep;
+        // didWake records the moment and refreshes NE's tunnel enumeration.
+        // Handlers run on arbitrary notification threads, so the marker is
+        // lock-protected (the loop thread reads and clears it).
+        let wakeLock = NSLock()
+        var wokeAt: Date?
+        let wakeCenter = NSWorkspace.shared.notificationCenter
+        wakeCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { _ in
+            wakeLock.lock()
+            wokeAt = nil
+            wakeLock.unlock()
+            statusSignal.signal()
+        }
+        wakeCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { _ in
+            wakeLock.lock()
+            wokeAt = Date()
+            wakeLock.unlock()
+            NEVPNWatcher.refresh(force: true)
+            statusSignal.signal()
+        }
         // Proton-only stabilized exit resolver. NordVPN and every other
         // provider keep using `countryResolver` above with unchanged behavior.
         let protonResolver = ProtonExitResolver(logger: logEvent)
@@ -847,6 +874,20 @@ private enum Main {
             }
 
             let now = Date()
+            // Right after a wake (grace window covers the handler's early
+            // signals while system state settles): re-verify NE against the
+            // routing table immediately so a tunnel that died during sleep
+            // cannot linger on the notch.
+            if let woke = wakeLock.withLock({ wokeAt }), now.timeIntervalSince(woke) < 10 {
+                PathWatcher.verifiedTunnelInterface()
+                // Reset the self-defense cadences so the sanity check (route
+                // table) and the scutil cross-check both run this tick no
+                // matter which source reports connected.
+                lastNESanityAt = nil
+                lastNECrossCheckAt = nil
+                wakeLock.withLock { wokeAt = nil }
+                logEvent("resumed from sleep; re-verified status")
+            }
             let vpn = resolveStatus(now: now, lastNESanityAt: &lastNESanityAt, lastNECrossCheckAt: &lastNECrossCheckAt)
 
             // macOS keeps the previous session marked Connected for a poll or two
@@ -1004,7 +1045,7 @@ private enum Main {
             }
 
             if state.connected, let probeAt = nextCountryProbeAt, now >= probeAt {
-                if routedTunnelInterface() == nil {
+                if PathWatcher.routedTunnelInterface() == nil {
                     nextCountryProbeAt = now.addingTimeInterval(0.5)
                 } else if protonActive, protonResolver.request(generation: countryGeneration) {
                     nextCountryProbeAt = nil
@@ -1309,7 +1350,7 @@ private enum Main {
                 : disconnectedPollIntervalSec
             let waitDeadline = Date().addingTimeInterval(interval)
             waitLoop: while running {
-                if neSignal.wait(timeout: .now() + 0.05) == .success { break waitLoop }
+                if statusSignal.wait(timeout: .now() + 0.05) == .success { break waitLoop }
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
                 if Date() >= waitDeadline { break waitLoop }
             }

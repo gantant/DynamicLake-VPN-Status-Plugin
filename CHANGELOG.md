@@ -2,6 +2,10 @@
 
 All notable changes to the VPN Status plugin. The latest release is also summarized in the [README](README.md).
 
+## 1.2.1
+
+Event-driven checks on top of 1.2.0's event-driven core: the routing-table verification (which guards NetworkExtension's answers and drives the WireGuard fallback) now rides `NWPathMonitor` — zero subprocess spawns and instant reaction to route changes, with the classic `route -n get` lookup retained as an automatic fallback whenever the pushed view is missing or stale, and as the always-verified final word before any decision that would tear down the event source (a fresh mirror contradicted by the real route table is permanently degraded to spawn-only). The plugin now observes macOS sleep/wake via `NSWorkspace`: after waking it re-verifies the tunnel and resets the self-defense cadences immediately, so a VPN that died during sleep cannot linger on the notch; the wake signal also interrupts the wait loop for an instant re-check.
+
 ## 1.2.0
 
 Event-driven status: the plugin now watches VPN tunnels through macOS's NetworkExtension framework instead of spawning `scutil` on every tick. Connect/disconnect transitions reach the notch in milliseconds (pushed by the system, not polled), and an idle-disconnected machine spawns essentially nothing. The proven `scutil` path remains as an automatic fallback: if NetworkExtension is unavailable, wedged, or ever disagrees with the routing table / scutil itself (checked on a slow 30–60s cadence), the plugin seamlessly returns to polling — including full support for non-NetworkExtension VPNs like the WireGuard app. Connect, disconnect, and server-switch presentations now announce at notification priority — the activity is created or promoted high-priority so the Sneak Peek presents like a banner — and an update drops it to the persistent profile once the peek finishes, so it settles into the extra live activity row as before. Server switches while connected always present a Sneak Peek announcing the new location. No settings changes otherwise.
