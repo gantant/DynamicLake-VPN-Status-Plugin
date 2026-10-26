@@ -24,8 +24,6 @@ let protonExitProbeGapSec: TimeInterval = 0.4
 /// interface, so the public exit IP is part of the effective connection
 /// identity and must be re-checked to notice the switch.
 let protonExitRefreshIntervalSec: TimeInterval = 5
-/// Keep in sync with `pluginUserAgent` in VPNStatusPlugin.swift.
-let protonExitUserAgent = "VPNStatus-DynamicLake/1.1.7"
 
 /// True only for ProtonVPN. NordVPN (and every other provider, including nil)
 /// must keep the existing single-shot country behavior.
@@ -398,7 +396,7 @@ final class ProtonExitResolver {
         request.timeoutInterval = 2
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue(protonExitUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(pluginUserAgent, forHTTPHeaderField: "User-Agent")
         session.dataTask(with: request) { [weak self] data, response, _ in
             if let http = response as? HTTPURLResponse,
                (200..<300).contains(http.statusCode),

@@ -40,7 +40,10 @@ rm -rf "$PKG.old"
 touch "$PKG"   # stamp the package folder itself with the build time
 
 echo "==> Packaging $ZIP"
-ditto -c -k --keepParent "$PKG" "$ZIP"
+# --norsrc/--noextattr keep AppleDouble (._*) entries out of the archive:
+# macOS tags downloaded files with com.apple.provenance, and ditto would
+# otherwise add one ~4 KB resource entry per flag inside the package.
+ditto -c -k --keepParent --norsrc --noextattr "$PKG" "$ZIP"
 touch "$ZIP"
 
 echo "==> Done. Install via DynamicLake Playground > Settings > Plugins > Install Local"

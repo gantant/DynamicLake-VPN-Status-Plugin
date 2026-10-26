@@ -2,8 +2,25 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Prefer a real interpreter over Apple's /usr/bin/python3 shim. That shim asks
+# the user to install the command line tools whenever it cannot read its
+# developer_dir, which is exactly what happens in a sandboxed shell — every run
+# then pops an "install command line developer tools" dialog. Override with
+# PYTHON=/path/to/python3 if needed.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if [ -x "$candidate" ]; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+PYTHON="${PYTHON:-/usr/bin/python3}"
+echo "==> Using $PYTHON ($("$PYTHON" -V 2>&1))"
+
 ./src/build.sh
-python3 tests/test_runtime.py
+"$PYTHON" tests/test_runtime.py
 
 TEST_BINARY=$(mktemp -t vpn-flag-smoke)
 PROTON_TEST_BINARY=$(mktemp -t vpn-proton-exit-tests)

@@ -2,6 +2,24 @@ import Foundation
 
 private var flagDataCache: [String: String] = [:]
 
+/// The flag PNG for a country, base64-encoded. nil when the packaged artwork
+/// is missing or unreadable. Also used to register the flag once with the
+/// `asset` command so flag-only updates stay small.
+func countryFlagBase64(countryCode: String) -> String? {
+    let code = countryCode.lowercased()
+    guard code.count == 2,
+          code.unicodeScalars.allSatisfy({ (97...122).contains(Int($0.value)) }) else {
+        return nil
+    }
+    if let encoded = flagDataCache[code] {
+        return encoded
+    }
+    guard let data = loadFlagData(countryCode: code) else { return nil }
+    let encoded = data.base64EncodedString()
+    flagDataCache[code] = encoded
+    return encoded
+}
+
 /// Inline images use the same proven DynamicLake path as the provider logos.
 /// Some host builds accept `packageFile` but fail to display it in compact slots.
 func countryFlagImagePayload(countryCode: String) -> [String: Any]? {
@@ -11,8 +29,7 @@ func countryFlagImagePayload(countryCode: String) -> [String: Any]? {
         return nil
     }
 
-    if let encoded = flagDataCache[code] ?? loadFlagData(countryCode: code)?.base64EncodedString() {
-        flagDataCache[code] = encoded
+    if let encoded = countryFlagBase64(countryCode: code) {
         return [
             "type": "image",
             "id": "vpn-country-flag",
