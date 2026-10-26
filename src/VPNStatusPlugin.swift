@@ -147,13 +147,27 @@ private let peekCountryRecheckSec: TimeInterval = 0.25
 /// Ordering on the socket is already FIFO, so this only needs to cover
 /// DynamicLake's per-frame apply latency.
 private let peekCountryLeadSec: TimeInterval = 0.1
-/// Keep in sync with the version in plugin.json.
-private let pluginUserAgent = "VPNStatus-DynamicLake/1.2.1"
 
 private let pluginFeatures: Set<String> = Set(
     (ProcessInfo.processInfo.environment["DYNAMICLAKE_PLUGIN_FEATURES"] ?? "").split(separator: ",").map(String.init)
 )
 private let supportsPresentSneakPeek = pluginFeatures.contains("presentSneakPeek")
+/// A lake needs both features: `lake` enables the manifest key, the command
+/// and the lakeOpened/lakeClosed events, while `lakeLayout` enables everything
+/// this card is built from (stacks, spacer, buttons, timer). Older DynamicLake
+/// builds advertise neither, so the plugin simply never sends a lake frame.
+private let supportsLake = pluginFeatures.contains("lake") && pluginFeatures.contains("lakeLayout")
+/// imageAssets raises the frame limit to 256 KB and lets a picture be
+/// registered once and referenced by id. Without it the plugin keeps sending
+/// the same artwork inline, exactly as 1.2.1 did.
+private let supportsImageAssets = pluginFeatures.contains("imageAssets")
+
+/// Provider logos are registered as assets for the current connection. The
+/// registration is cleared by DynamicLake when the socket drops, so the main
+/// loop re-registers after every reconnect. Empty means "nothing registered
+/// for the current provider" (the generic SF Symbol logo); the loop compares
+/// this against the live provider so the logo is sent once per connection.
+private var registeredLogoProvider: String = ""
 
 private struct VPNStatus {
     var connected: Bool
@@ -168,6 +182,10 @@ private struct VPNStatus {
     /// even when the config-level server address never changes. The scutil
     /// path keys on the live ServerAddress and leaves this nil.
     var sessionID: String?
+    /// Exact start of the current session when the source reports one
+    /// (NetworkExtension). The scutil fallback cannot know it, so the lake's
+    /// session timer is only shown when this is present.
+    var sessionStart: Date?
 }
 
 private struct ExitCountry {
@@ -324,7 +342,7 @@ private func serverAddress(for serviceName: String) -> String? {
 }
 
 private func getVPNStatus() -> VPNStatus {
-    let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil, sessionID: nil)
+    let disconnected = VPNStatus(connected: false, provider: nil, protocol_: nil, serviceName: nil, serverAddress: nil, routedInterface: nil, sessionID: nil, sessionStart: nil)
     var connectingProvider: String?
     let (out, _) = runProcess("/usr/sbin/scutil", arguments: ["--nc", "list"], log: logVPNStatusCalls ? logEvent : nil)
     if let str = String(data: out, encoding: .utf8) {
@@ -342,7 +360,10 @@ private func getVPNStatus() -> VPNStatus {
                     serviceName: serviceName,
                     serverAddress: serverAddress(for: serviceName),
                     routedInterface: nil,
-                    sessionID: nil
+                    sessionID: nil,
+                    // scutil has no session start date; the lake's timer is
+                    // omitted rather than shown as an approximation.
+                    sessionStart: nil
                 )
             }
             // A service mid-handshake names the provider that owns the tunnel
@@ -377,7 +398,8 @@ private func getVPNStatus() -> VPNStatus {
                     serviceName: nil,
                     serverAddress: nil,
                     routedInterface: routedInterface,
-                    sessionID: nil
+                    sessionID: nil,
+                    sessionStart: nil
                 )
             }
         }
@@ -489,7 +511,8 @@ private func neStatusToVPNStatus(_ s: NEVPNWatcher.Status) -> VPNStatus {
         serviceName: s.serviceName,
         serverAddress: s.serverAddress,
         routedInterface: nil,
-        sessionID: s.startDate.map { String(Int64($0.timeIntervalSince1970 * 1000)) }
+        sessionID: s.startDate.map { String(Int64($0.timeIntervalSince1970 * 1000)) },
+        sessionStart: s.startDate
     )
 }
 
@@ -529,12 +552,74 @@ private func disconnectedIcon() -> [String: Any] {
     ] as [String: Any]
 }
 
+/// Image slots prefer the registered asset (imageAssets feature) and fall back
+/// to the inline payload every older DynamicLake build understands. The asset
+/// forms are only used once the matching data has actually been registered for
+/// the current provider/country, so a reference can never show a placeholder.
+private func providerIconSlot(_ provider: String?) -> [String: Any] {
+    let key = provider ?? ""
+    if supportsImageAssets, !key.isEmpty, registeredLogoProvider == key, providerIconBase64(for: provider) != nil {
+        return ["type": "image", "id": "vpn-icon", "source": "asset", "assetID": "vpn-logo"]
+    }
+    return vpnIconPayload(for: provider)
+}
+
+/// The flag is always sent inline. An `asset` reference resolves fine in the
+/// compact activity but rendered nothing in the lake's header slot, and the
+/// artwork is a 64×64 PNG of about 2 KB, so registering it buys nothing worth
+/// the blank slot the user sees when a reference fails to resolve.
 private func flagSlot(_ countryCode: String) -> [String: Any]? {
     countryFlagImagePayload(countryCode: countryCode)
 }
 
+/// The flag slot at a point size. `size` is an image/button field: the emoji
+/// fallback `flagSlot` returns when the packaged artwork cannot be read is a
+/// TEXT component, and an unknown field on a component rejects the entire lake
+/// command (the same strictness that rejects a `top` padding inset), which would
+/// leave the user with DynamicLake's fallback card. So the size is only set on
+/// an image, and the emoji keeps its own font size.
+private func sizedFlagSlot(_ countryCode: String, size: Double) -> [String: Any]? {
+    guard var slot = flagSlot(countryCode) else { return nil }
+    if slot["type"] as? String == "image" {
+        slot["size"] = size
+    }
+    return slot
+}
+
+/// Registers the provider logo for the live provider once per connection or
+/// change. Assets are dropped by DynamicLake when the socket closes, so the
+/// reconnect path clears the marker and the next tick re-registers.
+private func ensureAssets(_ client: JSONSocketClient, provider: String?) {
+    guard supportsImageAssets else { return }
+    let providerKey = provider ?? ""
+    if providerKey != registeredLogoProvider {
+        if let base64 = providerIconBase64(for: provider) {
+            // Mark only after a successful frame: a failed asset send must
+            // leave the surfaces on their inline fallback until it retries.
+            if sendTracked(client, assetPayload(id: "vpn-logo", requestID: "asset-logo", base64: base64), "asset logo") {
+                registeredLogoProvider = providerKey
+            }
+        } else {
+            registeredLogoProvider = providerKey
+        }
+    }
+}
+
+private func assetPayload(id: String, requestID: String, base64: String) -> [String: Any] {
+    [
+        "schemaVersion": schemaVersion,
+        "requestID": requestID,
+        "type": "asset",
+        "asset": [
+            "id": id,
+            "mimeType": "image/png",
+            "base64Data": base64
+        ]
+    ] as [String: Any]
+}
+
 private func compactSurface(connected: Bool, provider: String?, countryCode: String) -> [String: Any] {
-    var surface: [String: Any] = ["leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon()]
+    var surface: [String: Any] = ["leftSlot": connected ? providerIconSlot(provider) : disconnectedIcon()]
     if let slot = flagSlot(countryCode) {
         surface["rightSlot"] = slot
     }
@@ -546,14 +631,14 @@ private func compactSurface(connected: Bool, provider: String?, countryCode: Str
 /// state stays recognizable. Matches `compactSurface` leftSlot on purpose:
 /// front = logo + flag, minimized = logo only.
 private func extraLiveActivitySurface(connected: Bool, provider: String?) -> [String: Any] {
-    ["leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon()]
+    ["leftSlot": connected ? providerIconSlot(provider) : disconnectedIcon()]
 }
 
 /// Shared sneak-peek shape: provider logo + detail text + optional country flag.
 /// Used by both persistent-mode and notify-mode peeks.
 private func makeSneakPeek(connected: Bool, provider: String?, countryCode: String, detail: String) -> [String: Any] {
     var peek: [String: Any] = [
-        "leftSlot": connected ? vpnIconPayload(for: provider) : disconnectedIcon(),
+        "leftSlot": connected ? providerIconSlot(provider) : disconnectedIcon(),
         "center": [
             "type": "text",
             "id": "vpn-detail",
@@ -679,19 +764,318 @@ private func dismissPayload() -> [String: Any] {
     ]
 }
 
+/// Launch the installed provider app. Bundle identifiers rather than URL
+/// schemes: both apps expose several schemes, and LaunchServices resolves the
+/// bundle id wherever the app actually lives — /Applications, ~/Applications,
+/// a renamed copy like "NordVPN 2.app", or an App Store install. The same
+/// resolver decides whether the lake's logo is pressable, so a provider whose
+/// app is not installed never gets a dead control.
+private let providerBundleIdentifiers: [String: String] = [
+    "ProtonVPN": "ch.protonvpn.mac",
+    "NordVPN": "com.nordvpn.NordVPN"
+]
+
+/// Successful lookups only; a miss is retried when the lake is next built, so
+/// installing the app while the plugin runs is picked up without a restart.
+private var resolvedProviderApps: [String: URL] = [:]
+
+private func providerAppURL(_ provider: String?) -> URL? {
+    guard let provider = provider, let bundleID = providerBundleIdentifiers[provider] else { return nil }
+    if let cached = resolvedProviderApps[provider] { return cached }
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+        return nil
+    }
+    resolvedProviderApps[provider] = url
+    return url
+}
+
+private func openProviderApp(provider: String?) {
+    guard let url = providerAppURL(provider) else {
+        logEvent("open app: no installed app for \(provider ?? "unknown provider")")
+        return
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+        if let error = error {
+            logEvent("open app failed: \(error.localizedDescription)")
+        } else {
+            logEvent("open app: \(url.lastPathComponent)")
+        }
+    }
+}
+
+/// "5:07" under an hour, "1:02:03" past it — hours only appear once the
+/// session actually has one. Rendered by the plugin (DynamicLake's `timer`
+/// component has no format control), so it is patched once per second while
+/// the lake is visible and not at all while it is closed.
+private func sessionClockText(now: Date, start: Date) -> String {
+    let total = max(0, Int(now.timeIntervalSince(start)))
+    let hours = total / 3600
+    let minutes = (total % 3600) / 60
+    let seconds = total % 60
+    if hours > 0 {
+        return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+    }
+    return String(format: "%d:%02d", minutes, seconds)
+}
+
+/// A clock tick replaces exactly one text component — the status line the clock
+/// lives in — so the frame stays tiny and never resends the rest of the lake.
+/// Sent only while the lake is open.
+private func lakeClockPatchPayload(text: String) -> [String: Any] {
+    [
+        "schemaVersion": schemaVersion,
+        "requestID": "lake-clock",
+        "type": "lakePatch",
+        "components": [
+            // A patch replaces the whole component, so the style has to travel
+            // with it: a bare text component drops back to primary (white) text
+            // one second after the card opens.
+            [
+                "type": "text",
+                "id": "session-line",
+                "text": text,
+                "style": "plain",
+                "tint": "gray"
+            ] as [String: Any]
+        ]
+    ]
+}
+
+/// The card's one line of state: connection state, exit country and the
+/// session clock, separated by middots — `Connected · Romania · 5:07`.
+private func lakeSubtitle(connected: Bool, countryName: String, clock: String? = nil) -> String {
+    if !connected { return "Not connected" }
+    var parts = ["Connected"]
+    if !countryName.isEmpty { parts.append(countryName) }
+    if let clock = clock, !clock.isEmpty { parts.append(clock) }
+    return parts.joined(separator: " · ")
+}
+
+/// The same line built from the card's inputs, so the card and the per-second
+/// clock patch can never disagree about what it says.
+private func lakeStatusLine(connected: Bool, countryName: String, sessionStart: Date?, now: Date) -> String {
+    let clock = connected ? sessionStart.map { sessionClockText(now: now, start: $0) } : nil
+    return lakeSubtitle(connected: connected, countryName: countryName, clock: clock)
+}
+
+/// The inputs a card is built from, kept so `lakeOpened` can be answered from
+/// the last card instead of waiting for the next status resolution (which can
+/// be mid DNS/geo lookup and take a second).
+private struct LakeCardInputs {
+    var connected: Bool
+    var provider: String?
+    var countryCode: String
+    var countryName: String
+    var sessionStart: Date?
+
+    /// The same fields the main loop compares to decide the card changed.
+    var signature: String {
+        [
+            connected ? "1" : "0",
+            provider ?? "",
+            countryCode,
+            countryName,
+            sessionStart.map { String($0.timeIntervalSince1970) } ?? ""
+        ].joined(separator: "|")
+    }
+}
+
+/// Lifts the card body off the bottom edge. `padding` is the only layout knob a
+/// JSON component has, and its validator accepts exactly three fields — `leading`, `bottom` and `trailing` (a `top` inset is rejected with
+/// "Invalid field 'top' at $.lake.content[0].padding", which rejects the whole
+/// lake command). The bottom inset is therefore the only vertical control:
+/// space under the row, which lifts it wherever the card pins its content and
+/// costs nothing where it does not.
+private let lakeRowBottomInset: Double = 6
+
+/// The disconnected card sits flush instead of lifted. Its row is the same
+/// height as the connected one (the flag no longer stacks a clock under
+/// itself), so the same inset would push its text up into the notch, where the
+/// connected card has never clipped. Zero drops the row by the handful of
+/// points the connected card is lifted by.
+private let lakeDisconnectedRowBottomInset: Double = 0
+
+/// Clearance above the card's row, in points. Both cards were clipped by the
+/// notch after the trailing column lost its clock, which shortened the row and
+/// pulled the name up with it; this pushes the row back down. It is a fixed
+/// spacer because a lake's `padding` accepts no top edge. `length` is documented
+/// from 0 to 200, so 0 is legal — it is just no clearance — but the body stack
+/// must keep spacing 0, or the stack's own 10-point gap is added to this and a
+/// 1-point spacer lands as ~11.
+private let lakeTopGap: Double = 1
+
+/// The logo, carrying the app-launching action.
+///
+/// A button is the only component DynamicLake routes actions from, and a button
+/// cannot be transparent: `plain` draws an opaque disc for the missing symbol (a
+/// zero-width title does not suppress it), and any symbol it is given is drawn.
+/// A `plain` button *behind* the artwork is drawn under it and — being behind a
+/// hit-testable image — does not reliably receive the press. So the control is
+/// the logo's right-click menu instead, which every component can have and which
+/// draws nothing until it is opened: right-clicking the provider mark offers
+/// "Open <provider>" and launches the app. A provider whose app is not installed
+/// (or a generic routed tunnel) gets no menu entry at all.
+private func lakeLogoSlot(connected: Bool, provider: String?) -> [String: Any] {
+    var logo = connected ? providerIconSlot(provider) : disconnectedIcon()
+    logo["size"] = 30
+    guard providerAppURL(provider) != nil else { return logo }
+    logo["contextMenu"] = [
+        [
+            "title": "Open \(providerDisplayName(provider))",
+            "systemImage": "arrow.up.forward.app",
+            "actionID": "open-app"
+        ] as [String: Any]
+    ]
+    return logo
+}
+
+/// The lake card. It is a notification-sized card (390 × 80, declared through
+/// `lake.size` in plugin.json), which is one row tall: the built-in header row
+/// is hidden (its slots are fixed, so they cannot carry a real layout) and the
+/// body is laid out by hand as a single row of facts — the provider logo, the
+/// provider name over one line of state (country and session clock included),
+/// and the exit-country flag at the trailing edge. There is no button row and no
+/// drawn control: the app-launching action hangs off the logo's right-click menu.
+/// The clock is still NetworkExtension-only, so it is never an estimate.
+private func lakePayload(connected: Bool, provider: String?, countryCode: String, countryName: String, sessionStart: Date?, now: Date) -> [String: Any] {
+    let providerName = provider == nil ? pluginName : providerDisplayName(provider)
+    let statusLine = lakeStatusLine(connected: connected, countryName: countryName, sessionStart: sessionStart, now: now)
+
+    var topRow: [[String: Any]] = [
+        lakeLogoSlot(connected: connected, provider: provider),
+        [
+            "type": "vstack",
+            "spacing": 1,
+            "alignment": "leading",
+            "children": [
+                // The freed-up header space goes into the name, which is the line
+                // the card is actually read for.
+                ["type": "text", "text": providerName, "style": "large", "weight": "semibold"] as [String: Any],
+                // The state line is secondary text: DynamicLake has no dedicated
+                // secondary style, so plain + gray is it. The per-second clock
+                // patch resends both fields, or the line turns primary white.
+                ["type": "text", "id": "session-line", "text": statusLine, "style": "plain", "tint": "gray"] as [String: Any]
+            ]
+        ],
+        ["type": "spacer"]
+    ]
+
+    // The flag closes the row on its own — the clock that used to sit under it
+    // now rides the status line, which is why it can be this size.
+    if connected, let flag = sizedFlagSlot(countryCode, size: 30) {
+        topRow.append(flag)
+    }
+
+    // The row starts a few points down: with the clock gone from the trailing
+    // column both cards are the same height, and the row sits high enough that
+    // the notch clips the top of the name. A fixed spacer above it is the only
+    // downward control a lake has (`padding` takes no top edge), and it applies
+    // to both states so the two cards stay identical.
+    var body: [[String: Any]] = []
+    if lakeTopGap > 0 {
+        body.append(["type": "spacer", "length": lakeTopGap] as [String: Any])
+    }
+    body.append(["type": "hstack", "id": "lake-top", "spacing": 10, "children": topRow] as [String: Any])
+
+    return [
+        "schemaVersion": schemaVersion,
+        "requestID": "lake",
+        "type": "lake",
+        "lake": [
+            "hideHeader": true,
+            "content": [
+                [
+                    "type": "vstack",
+                    "id": "lake-body",
+                    // Zero so the clearance spacer above the row is the exact
+                    // gap it says it is; a stack spacing would be added to it.
+                    "spacing": 0,
+                    "padding": [
+                        "leading": 0,
+                        "bottom": connected ? lakeRowBottomInset : lakeDisconnectedRowBottomInset,
+                        "trailing": 0
+                    ],
+                    "children": body
+                ] as [String: Any]
+            ],
+            "glance": glanceSurface(connected: connected, provider: provider, countryCode: countryCode)
+        ]
+    ] as [String: Any]
+}
+
+/// DynaGlance's right side is far smaller than the lake: hide the default
+/// header and lay the same facts out as one compact row.
+private func glanceSurface(connected: Bool, provider: String?, countryCode: String) -> [String: Any] {
+    var logo = connected ? providerIconSlot(provider) : disconnectedIcon()
+    logo["size"] = 24
+    var children: [[String: Any]] = [
+        logo,
+        [
+            "type": "vstack",
+            "spacing": 0,
+            "alignment": "leading",
+            "children": [
+                ["type": "text", "text": provider == nil ? pluginName : providerDisplayName(provider), "style": "compact", "weight": "semibold"] as [String: Any],
+                ["type": "text", "text": connected ? "Connected" : "Not connected", "style": "compact", "tint": "gray"] as [String: Any]
+            ]
+        ] as [String: Any],
+        ["type": "spacer"]
+    ]
+    if connected, let flag = sizedFlagSlot(countryCode, size: 20) {
+        children.append(flag)
+    }
+    return [
+        "hideHeader": true,
+        "content": [
+            ["type": "hstack", "spacing": 6, "children": children] as [String: Any]
+        ]
+    ] as [String: Any]
+}
+
+/// The last parsed settings file, keyed by the file's identity so a rewrite is
+/// picked up immediately and an unchanged file is never read again.
+private struct SettingsCache {
+    let path: String
+    let modified: Date?
+    let size: UInt64
+    let values: [String: Any]
+}
+
+/// Settings are read several times per loop iteration — as often as every 100ms
+/// while a connection is being confirmed — so the file is only parsed when its
+/// modification date or size actually changed. `attributesOfItem` is one stat
+/// call; the previous path re-read and re-parsed the JSON every time.
+private var settingsCache: SettingsCache?
+
 /// Reads a boolean setting. The settings file is the source of truth: DynamicLake
 /// rewrites it when the user toggles a switch, while the environment variable is
 /// only a snapshot from process launch and never updates for a running plugin.
 private func readBoolSetting(_ id: String, envKey: String) -> Bool {
-    if let settingsPath = ProcessInfo.processInfo.environment[settingsPathEnvironmentKey],
-       let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)) {
-        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let values = obj["values"] as? [String: Any] {
-            return values[id] as? Bool ?? false
+    if let settingsPath = ProcessInfo.processInfo.environment[settingsPathEnvironmentKey] {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: settingsPath)
+        let modified = attributes?[.modificationDate] as? Date
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+
+        if attributes != nil,
+           let cached = settingsCache,
+           cached.path == settingsPath,
+           cached.modified == modified,
+           cached.size == size {
+            return cached.values[id] as? Bool ?? false
         }
-        if !settingsParseFailureLogged {
-            settingsParseFailureLogged = true
-            logEvent("settings parse failed at \(settingsPath); falling back to env/defaults")
+
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)) {
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let values = obj["values"] as? [String: Any] {
+                settingsCache = SettingsCache(path: settingsPath, modified: modified, size: size, values: values)
+                return values[id] as? Bool ?? false
+            }
+            if !settingsParseFailureLogged {
+                settingsParseFailureLogged = true
+                logEvent("settings parse failed at \(settingsPath); falling back to env/defaults")
+            }
         }
     }
     if let env = ProcessInfo.processInfo.environment[envKey] {
@@ -710,13 +1094,29 @@ private func readPersistOnDisconnect() -> Bool {
     readBoolSetting("persistOnDisconnect", envKey: "DYNAMICLAKE_SETTING_PERSIST_ON_DISCONNECT")
 }
 
+/// How long the plugin keeps reconnecting when every write fails. A closed
+/// socket usually means DynamicLake is done with this process (app quit, plugin
+/// restart, reinstall); without a bound the process loops forever, and a pile of
+/// stale instances compete for the same socket and clobber each other's assets.
+private let socketGiveUpAfterSec: TimeInterval = 60
+private var lastSuccessfulSendAt = Date()
+private var consecutiveSendFailures = 0
+
 @discardableResult
 private func sendTracked(_ client: JSONSocketClient, _ payload: [String: Any], _ label: String) -> Bool {
     do {
         try client.send(payload)
+        lastSuccessfulSendAt = Date()
+        consecutiveSendFailures = 0
         return true
     } catch {
+        consecutiveSendFailures += 1
         logEvent("send failed \(label): \(error)")
+        let silentFor = Date().timeIntervalSince(lastSuccessfulSendAt)
+        if silentFor > socketGiveUpAfterSec, consecutiveSendFailures > 10 {
+            logEvent("socket unusable for \(Int(silentFor))s; exiting so DynamicLake can relaunch the plugin")
+            exit(0)
+        }
         return false
     }
 }
@@ -776,6 +1176,20 @@ private enum Main {
         var countryConnectionKey = ""
         var nextCountryProbeAt: Date?
         var lastReassertAt: Date?
+        /// Lake bookkeeping: the signature of the state the card currently
+        /// shows, plus a flag set when DynamicLake reports the lake opening so
+        /// visible content is always refreshed even if nothing else changed.
+        var lastLakeSig = ""
+        var lakeRefreshRequested = false
+        /// Last card sent, so a lakeOpened can be answered without a status poll.
+        var lastLakeInputs: LakeCardInputs?
+        /// True between lakeOpened and lakeClosed. The clock only ticks while
+        /// the card is actually on screen.
+        var lakeVisible = false
+        var lastClockText = ""
+        /// Provider the visible card was built for, so a press on the logo opens
+        /// the app it belongs to even if the tunnel state changed in between.
+        var lakeProvider: String?
         let countryResolver = ExitCountryResolver()
         // NetworkExtension event source: loaded once before the loop; the
         // signal fires on every NEVPNStatusDidChange so transitions interrupt
@@ -834,6 +1248,84 @@ private enum Main {
         // provider keep using `countryResolver` above with unchanged behavior.
         let protonResolver = ProtonExitResolver(logger: logEvent)
 
+        /// Sends the lake card for `inputs` and updates the bookkeeping that
+        /// keeps an unchanged card from being resent. The clock text is seeded
+        /// from the card itself, so the wait loop does not patch it straight
+        /// after it was drawn.
+        @discardableResult
+        func sendLake(_ client: JSONSocketClient, _ inputs: LakeCardInputs, _ reason: String) -> Bool {
+            let now = Date()
+            guard sendTracked(
+                client,
+                lakePayload(
+                    connected: inputs.connected,
+                    provider: inputs.provider,
+                    countryCode: inputs.countryCode,
+                    countryName: inputs.countryName,
+                    sessionStart: inputs.sessionStart,
+                    now: now
+                ),
+                reason
+            ) else { return false }
+            lastLakeSig = inputs.signature
+            lastLakeInputs = inputs
+            lakeRefreshRequested = false
+            lakeProvider = inputs.provider
+            lastClockText = lakeStatusLine(
+                connected: inputs.connected,
+                countryName: inputs.countryName,
+                sessionStart: inputs.sessionStart,
+                now: now
+            )
+            return true
+        }
+
+        /// Drains DynamicLake's frames. Called at the top of the loop and from
+        /// inside the wait, so opening the lake refreshes it immediately instead
+        /// of waiting out a poll (up to a full idle interval when disconnected).
+        func pumpEvents(_ client: JSONSocketClient) {
+            for response in client.receiveAvailable() {
+                let type = response["type"] as? String ?? ""
+                let isRejectedResponse = type == "response" && response["ok"] as? Bool == false
+                switch type {
+                case "lakeOpened":
+                    // Only while the lake is visible: refresh its content (and
+                    // the artwork it may need) on the opening frame itself.
+                    let trigger = response["trigger"] as? String ?? "unknown"
+                    let size = response["size"] as? String ?? "unknown"
+                    logEvent("lake opened trigger=\(trigger) size=\(size)")
+                    lakeVisible = true
+                    lakeRefreshRequested = true
+                    // Repaint from the last card we built, right here: the loop
+                    // may be mid status resolution (DNS/geo lookups) and the
+                    // card the user just opened must not wait for that. A failed
+                    // send leaves the refresh requested, for the loop to retry.
+                    if let inputs = lastLakeInputs {
+                        sendLake(client, inputs, "lake open")
+                    }
+                case "lakeClosed":
+                    logEvent("lake closed")
+                    lakeVisible = false
+                    lastClockText = ""
+                case "action":
+                    let surface = response["surface"] as? String ?? ""
+                    let actionID = response["actionID"] as? String ?? ""
+                    logEvent("action=\(actionID) surface=\(surface)")
+                    if actionID == "open-app" {
+                        openProviderApp(provider: lakeProvider)
+                    }
+                case "error":
+                    if let message = response["error"] as? String {
+                        logEvent("dynamiclake error: \(message)")
+                    }
+                default:
+                    if isRejectedResponse, let message = response["error"] as? String {
+                        logEvent("dynamiclake error: \(message)")
+                    }
+                }
+            }
+        }
+
         func reconnect() {
             client.close()
             do {
@@ -842,6 +1334,11 @@ private enum Main {
             } catch {
                 logEvent("reconnect failed: \(error)")
             }
+            // Assets live and die with the socket session, so nothing may
+            // reference them until the next tick re-registers them. The lake
+            // content is re-sent too, in case it was cleared with the session.
+            registeredLogoProvider = ""
+            lastLakeSig = ""
         }
 
         func connectionKey(for vpn: VPNStatus) -> String {
@@ -852,13 +1349,7 @@ private enum Main {
         }
 
         while running {
-            for response in client.receiveAvailable() {
-                let isRejectedResponse = response["type"] as? String == "response" && response["ok"] as? Bool == false
-                if (response["type"] as? String == "error" || isRejectedResponse),
-                   let message = response["error"] as? String {
-                    logEvent("dynamiclake error: \(message)")
-                }
-            }
+            pumpEvents(client)
 
             let notifyOnChange = readNotifyOnChange()
 
@@ -1069,6 +1560,23 @@ private enum Main {
                 state.routedInterface ?? ""
             ].joined(separator: "|")
             let sig = baseSig + "|" + currentCountryCode
+
+            // Register the artwork this frame's surfaces reference (no-op when
+            // the imageAssets feature is absent or nothing changed).
+            ensureAssets(client, provider: state.provider)
+
+            if supportsLake {
+                let inputs = LakeCardInputs(
+                    connected: state.connected,
+                    provider: state.provider,
+                    countryCode: currentCountryCode,
+                    countryName: currentCountryName,
+                    sessionStart: state.sessionStart
+                )
+                if lakeRefreshRequested || inputs.signature != lastLakeSig {
+                    if !sendLake(client, inputs, "lake") { reconnect() }
+                }
+            }
 
             // Shared by both modes: present a scheduled peek via a delayed update
             // on unchanged surfaces (the only shape DynamicLake reliably honours).
@@ -1357,6 +1865,27 @@ private enum Main {
             waitLoop: while running {
                 if statusSignal.wait(timeout: .now() + 0.05) == .success { break waitLoop }
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+                // Handle DynamicLake's frames while waiting: a lakeOpened must
+                // refresh the card right away, not on the next status poll.
+                pumpEvents(client)
+                if lakeRefreshRequested { break waitLoop }
+                // The lake clock: one small patch per second, and only while
+                // the card is on screen. Everything else keeps its normal
+                // cadence — this rides the existing wait, it does not add one.
+                if supportsLake, lakeVisible, state.connected, let start = state.sessionStart {
+                    // The clock is part of the status line now, so a tick patches
+                    // that whole line — still a single text component.
+                    let line = lakeStatusLine(
+                        connected: true,
+                        countryName: currentCountryName,
+                        sessionStart: start,
+                        now: Date()
+                    )
+                    if line != lastClockText,
+                       sendTracked(client, lakeClockPatchPayload(text: line), "lake clock") {
+                        lastClockText = line
+                    }
+                }
                 if Date() >= waitDeadline { break waitLoop }
             }
         }

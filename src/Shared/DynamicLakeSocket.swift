@@ -8,6 +8,13 @@ public let DynamicLakeSendRetryDelayUs: UInt32 = 10_000
 /// wedged DynamicLake feeds the plugin's reconnect path instead of hanging it.
 public let DynamicLakeSendMaxRetries = 100
 
+/// User agent for every HTTPS lookup the plugin makes (exit country, Proton exit
+/// identity). One constant for all of them, kept in sync with the version in
+/// `plugin.json`; a per-file copy is how the Proton lookups ended up identifying
+/// as 1.1.7 in a 1.3.x build. Lives here because this file is compiled into the
+/// plugin and into every test target that performs lookups.
+public let pluginUserAgent = "VPNStatus-DynamicLake/1.3.1"
+
 public enum DynamicLakeSocketError: Error, CustomStringConvertible {
     case socketPathMissing(String)
     case socket(String)
