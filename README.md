@@ -73,7 +73,7 @@ The suites cover the announcement contract and lake frames (driving the real bin
 - **gantant** ([@gantant](https://github.com/gantant)) — original plugin and ongoing development
 - **Rafael Reverberi** ([@rafaelreverberi](https://github.com/rafaelreverberi)) — ProtonVPN exit-country stabilization (1.1.6) and bundled flag artwork
 
-Flag artwork is derived from [flag-icons](https://github.com/lipis/flag-icons), MIT licensed, see `src/flags/LICENSE-flag-icons.txt`.
+Flag artwork is derived from [flag-icons](https://github.com/lipis/flag-icons), MIT licensed, see `VPN Status/src/flags/LICENSE-flag-icons.txt`.
 
 ## Changelog
 
