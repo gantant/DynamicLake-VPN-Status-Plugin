@@ -181,11 +181,11 @@ final class ProtonExitResolver {
     /// can apply the result without polling `takeResult`. The plugin renders on
     /// the main queue, so the handler only has to wake it.
     var onResult: (() -> Void)?
-    /// Routine per-probe lines (`probe started`, `exit stable country=`) fire
-    /// on every 5s re-probe while connected and would grow the log without
-    /// bound, so production leaves this off; anomaly lines (route mismatch,
-    /// unstable pair, stale discards) always log. Tests opt in to assert on
-    /// the routine lines.
+    /// Routine per-probe lines (`probe started`, `exit stable country=`) fire on
+    /// every probe the plugin asks for and would grow the log without much value,
+    /// so production leaves this off; anomaly lines (route mismatch, unstable
+    /// pair, stale discards) always log. Tests opt in to assert on the routine
+    /// lines.
     private let logsRoutineDiagnostics: Bool
 
     init(

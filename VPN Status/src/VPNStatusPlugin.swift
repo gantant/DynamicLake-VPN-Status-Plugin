@@ -149,7 +149,6 @@ private let peekAfterSurfaceUpdateSec: TimeInterval = 0.4
 /// On connect, the peek waits for the exit-country lookup so it always shows
 /// logo + country + flag in one presentation — it never peeks without the
 /// country while connected. Disconnect peeks are unaffected (no country).
-private let peekCountryRecheckSec: TimeInterval = 0.25
 /// Once the country arrives while a peek is pending, the flag refresh is sent
 /// first; the peek follows this much later as a pure presentation update.
 /// Ordering on the socket is already FIFO, so this only needs to cover
@@ -569,10 +568,6 @@ private func statusSneakPeek(connected: Bool, provider: String?, countryCode: St
     var detail = connected ? "\(providerName) connected" : "VPN disconnected"
     if connected, !countryName.isEmpty { detail = "\(providerName) · \(countryName)" }
     return makeSneakPeek(connected: connected, provider: provider, countryCode: countryCode, detail: detail)
-}
-
-private func createPayload(connected: Bool, provider: String?, countryCode: String, countryName: String = "") -> [String: Any] {
-    makeCreatePayload(connected: connected, provider: provider, countryCode: countryCode, countryName: countryName, priority: "low", size: "small")
 }
 
 /// Connect creates go out at notification priority so the connect Sneak Peek
@@ -1313,6 +1308,10 @@ private final class VPNStatusPlugin {
 
     private func reconnect() {
         guard !shutdownRequested else { return }
+        // A retry already queued must not fire after this one succeeds: it would
+        // tear down the socket that just came back.
+        reconnectWork?.cancel()
+        reconnectWork = nil
         socketSource?.cancel()
         socketSource = nil
         client.close()
@@ -1327,10 +1326,14 @@ private final class VPNStatusPlugin {
             scheduleReconnect()
         }
         // Assets live and die with the socket session, so nothing may reference
-        // them until they are re-registered. The lake content is re-sent too, in
-        // case it was cleared with the session.
+        // them until they are re-registered, and the activity that session
+        // carried may be gone with it — so the plugin no longer claims a card is
+        // on screen. The next pass re-registers and re-presents from scratch.
         registeredLogoProvider = ""
         lastLakeSig = ""
+        published = false
+        lastBaseSig = ""
+        lastFullSig = ""
         lakeRefreshRequested = true
     }
 
@@ -1370,7 +1373,9 @@ private final class VPNStatusPlugin {
         if let confirmAt { dates.append(confirmAt) }
         // DynamicLake's timer stops counting at its armed end, so the card is
         // re-sent before that to start a fresh window. Once per window roll.
-        if connected, published, lastLakeInputs?.sessionStart != nil, let armed = armedSessionTimer {
+        // Nothing to re-arm when the host rejected the timer: that card carries
+        // no clock, so a window roll would only resend identical content.
+        if connected, published, !lakeTimerUnsupported, lastLakeInputs?.sessionStart != nil, let armed = armedSessionTimer {
             dates.append(armed.end.addingTimeInterval(-sessionTimerRearmMargin))
         }
         guard let next = dates.min() else { return }
@@ -1498,6 +1503,16 @@ private final class VPNStatusPlugin {
         return "route|\(vpn.provider ?? "")|\(vpn.routedInterface ?? "")"
     }
 
+    /// Arms the drop back to the resting profile, once, for a card that was
+    /// created at notification priority and whose peek has been presented, held
+    /// back or dropped. Without it a peek that never presents — no exit country
+    /// for the session — would leave the card announced as a notification for as
+    /// long as the connection lasts.
+    private func armDemoteIfOwed(_ now: Date) {
+        guard !activityDemoted, demoteAt == nil else { return }
+        demoteAt = now.addingTimeInterval(sneakPeekPresentationSec + 0.25)
+    }
+
     private func releaseHeldPeek(_ now: Date) {
         guard peekHeld else { return }
         peekHeld = false
@@ -1538,10 +1553,17 @@ private final class VPNStatusPlugin {
 
         let now = Date()
         // Right after a wake (the grace window covers signals that arrive while
-        // system state settles) nothing cached about the session is trusted.
+        // system state settles) nothing cached about the session is trusted: a
+        // lookup in flight when the machine slept belongs to the past, and the
+        // exit itself may have moved. The country is dropped and asked for again
+        // once the connection is known.
+        let resumedFromSleep: Bool
         if let woke = wakeLock.withLock({ wokeAt }), now.timeIntervalSince(woke) < 10 {
             wakeLock.withLock { wokeAt = nil }
-            logEvent("resumed from sleep; re-verified status")
+            resumedFromSleep = true
+            logEvent("resumed from sleep; re-verifying status and exit country")
+        } else {
+            resumedFromSleep = false
         }
 
         let vpn = resolveStatus()
@@ -1631,6 +1653,16 @@ private final class VPNStatusPlugin {
             countryChanged = true
         }
 
+        // The exit is resolved again after a sleep: the lookup that was in flight
+        // belongs to the past, and the country may have changed while suspended.
+        // The answer already on screen stays there until a different one arrives,
+        // so the flag does not blink for a second after every wake.
+        if resumedFromSleep, state.connected {
+            countryGeneration &+= 1
+            countryProbeAttempts = 0
+            nextCountryProbeAt = now.addingTimeInterval(countryLookupSettleSec)
+        }
+
         // Provider-specific exit lookup. ProtonVPN uses the stabilized two-probe
         // exit-IP resolver; every other provider uses the single-shot country
         // resolver. The inactive path is drained so a provider switch cannot leak
@@ -1710,19 +1742,29 @@ private final class VPNStatusPlugin {
         if state.connected, let probeAt = nextCountryProbeAt, now >= probeAt {
             // A routed status was read from the routing table, so the tunnel is
             // already proven to be carrying traffic; it must not be asked to
-            // disprove itself.
-            if state.routedInterface == nil, PathWatcher.tunnelInterface() == nil {
+            // disprove itself. A transparent proxy is the exception: it installs
+            // no route at all, so the table can never speak for it and its own
+            // connection is the only evidence there is.
+            if !state.isProxy, state.routedInterface == nil, PathWatcher.tunnelInterface() == nil {
                 countryProbeAttempts += 1
                 nextCountryProbeAt = countryProbeAttempts < countryProbeMaxAttempts
                     ? now.addingTimeInterval(countryLookupRetrySec) : nil
-            } else if protonActive {
-                // An in-flight lookup wakes the plugin when it finishes, so the
-                // deadline is cleared either way rather than re-armed.
-                _ = protonResolver.request(generation: countryGeneration)
-                nextCountryProbeAt = nil
             } else {
-                _ = countryResolver.request(generation: countryGeneration)
-                nextCountryProbeAt = nil
+                // A request refused because a lookup is still in flight belongs
+                // to the previous connection, so its result is discarded as
+                // stale. The deadline is re-armed rather than consumed: dropping
+                // it would leave this session with no country (and no flag) until
+                // the next connection change.
+                let started = protonActive
+                    ? protonResolver.request(generation: countryGeneration)
+                    : countryResolver.request(generation: countryGeneration)
+                if started {
+                    nextCountryProbeAt = nil
+                } else {
+                    countryProbeAttempts += 1
+                    nextCountryProbeAt = countryProbeAttempts < countryProbeMaxAttempts
+                        ? now.addingTimeInterval(countryLookupRetrySec) : nil
+                }
             }
         }
 
@@ -1768,8 +1810,11 @@ private final class VPNStatusPlugin {
             pendingPeekAt = nil
             if shouldHoldPeekForCountry(connected: state.connected, countryCode: currentCountryCode) {
                 // Nothing correct to present yet. The country's arrival releases
-                // this (releaseHeldPeek); there is no re-check to arm.
+                // this (releaseHeldPeek); there is no re-check to arm. The demote
+                // is still owed, though: the card was created at notification
+                // priority for a peek that may now never present.
                 peekHeld = true
+                armDemoteIfOwed(now)
             } else if published {
                 // The capsule/notification from the create is established by
                 // now, so the peek update is honoured.
@@ -1788,9 +1833,7 @@ private final class VPNStatusPlugin {
                     // notification priority for this connect, schedule the drop
                     // back to the persistent profile for when the peek's
                     // presentation window has fully closed.
-                    if !activityDemoted, demoteAt == nil {
-                        demoteAt = now.addingTimeInterval(sneakPeekPresentationSec + 0.25)
-                    }
+                    armDemoteIfOwed(now)
                     // Sync the signatures so nothing re-sends these surfaces
                     // while the peek is on screen.
                     lastBaseSig = baseSig
@@ -1951,13 +1994,17 @@ private final class VPNStatusPlugin {
                             payload["requestID"] = "promote-\(updateSequence)"
                             activityDemoted = false
                         }
-                        if !sendTracked(client, payload, "surface update") {
+                        if sendTracked(client, payload, "surface update") {
+                            pendingPeekAt = now.addingTimeInterval(peekAfterSurfaceUpdateSec)
+                            lastBaseSig = baseSig
+                            lastFullSig = sig
+                        } else {
+                            // Nothing was presented, so nothing may be remembered
+                            // as presented: the signatures suppress the retry.
                             published = false
                             lastBaseSig = ""
                             lastFullSig = ""
                             reconnect()
-                        } else {
-                            pendingPeekAt = now.addingTimeInterval(peekAfterSurfaceUpdateSec)
                         }
                     } else if sendTracked(client, connectCreatePayload(connected: state.connected, provider: state.provider, countryCode: currentCountryCode, countryName: currentCountryName), "create") {
                         published = true
@@ -1968,9 +2015,18 @@ private final class VPNStatusPlugin {
                         // DynamicLake ignores presentSneakPeek on creates and on
                         // updates racing the create.
                         pendingPeekAt = now.addingTimeInterval(peekDelaySec)
+                        lastBaseSig = baseSig
+                        lastFullSig = sig
+                    } else {
+                        // A create that never arrived is not published. Stamping
+                        // the signature here used to suppress every retry, so one
+                        // failed frame could leave the notch empty for the whole
+                        // session.
+                        published = false
+                        lastBaseSig = ""
+                        lastFullSig = ""
+                        reconnect()
                     }
-                    lastBaseSig = baseSig
-                    lastFullSig = sig
                 } else if published, sig != lastFullSig {
                     // Only the country flag changed: refresh the live activity in
                     // place instead of re-presenting the sneak peek.

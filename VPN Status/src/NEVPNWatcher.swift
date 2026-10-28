@@ -55,8 +55,8 @@ public enum NEVPNWatcher {
     }
 
     /// Called on an arbitrary queue whenever any NE tunnel reports a status
-    /// change. Set before `load` so early events are not missed; the plugin
-    /// uses it to wake its wait loop immediately.
+    /// change. Set before `load` so early events are not missed; the plugin uses
+    /// it to wake the main queue and re-render immediately.
     public static var onStatusChange: (() -> Void)?
 
     /// Called when the set of transparent-proxy configurations changes (name
@@ -80,6 +80,11 @@ public enum NEVPNWatcher {
     private static var observersRegistered = false
     private static var notificationQueue: OperationQueue?
     private static var lastRefreshAt = Date.distantPast
+    /// Bounded retry for the initial enumeration: the framework can fail
+    /// transiently right after launch.
+    private static let loadRetryDelaySec: TimeInterval = 5
+    private static let loadMaxAttempts = 3
+    private static var loadRetryWork: DispatchWorkItem?
     /// Epoch until which bestStatus refuses to report (set after a load
     /// failure or a cross-check contradiction); expired state self-heals.
     private static var unhealthyUntil = Date.distantPast
@@ -162,21 +167,51 @@ public enum NEVPNWatcher {
     /// wake it when the tunnels are known.
     public static func load(completion: ((Bool) -> Void)? = nil) {
         registerObserversIfNeeded()
-        NETunnelProviderManager.loadAllFromPreferences { managers, error in
-            lock.lock()
-            if error == nil {
-                self.managers = managers ?? []
-                loaded = true
-                lastRefreshAt = Date()
-            }
-            lock.unlock()
-            if error != nil { markUnhealthy() }
-            completion?(error == nil)
-        }
+        lock.lock()
+        loadRetryWork?.cancel()
+        loadRetryWork = nil
+        lock.unlock()
+        loadTunnels(attempt: 1, completion: completion)
         // Proxies load alongside, not in series: a host with no proxy VPN has
         // nothing to wait for, and a slow proxy lookup must not delay the
         // tunnel path (which is what decides this source's health).
         loadProxyManagers()
+    }
+
+    /// Enumerates the tunnels, retrying a failed attempt a bounded number of
+    /// times.
+    ///
+    /// One transient failure at load time used to leave this source dark for the
+    /// life of the process: `loaded` only flips true on success, and nothing but
+    /// a status notification or a wake would ask again — so a Nord or Proton
+    /// session was named by the routing table's generic "VPN" until restart.
+    private static func loadTunnels(attempt: Int, completion: ((Bool) -> Void)?) {
+        NETunnelProviderManager.loadAllFromPreferences { managers, error in
+            if error == nil {
+                lock.lock()
+                self.managers = managers ?? []
+                loaded = true
+                lastRefreshAt = Date()
+                // A retry that works ends the unhealthy window it opened; the
+                // answers are usable now, not sixty seconds from now.
+                unhealthyUntil = Date.distantPast
+                lock.unlock()
+                completion?(true)
+                return
+            }
+            markUnhealthy()
+            guard attempt < loadMaxAttempts else {
+                completion?(false)
+                return
+            }
+            let item = DispatchWorkItem { loadTunnels(attempt: attempt + 1, completion: completion) }
+            lock.lock()
+            loadRetryWork = item
+            lock.unlock()
+            // Main queue, because that is the one the plugin services; NE
+            // delivery does not depend on it, so this is only a wake-up.
+            DispatchQueue.main.asyncAfter(deadline: .now() + loadRetryDelaySec, execute: item)
+        }
     }
 
     /// Re-enumerates tunnels (new configs can appear after first load).
@@ -314,10 +349,9 @@ public enum NEVPNWatcher {
         defer { lock.unlock() }
         guard !observersRegistered else { return }
         observersRegistered = true
-        // An explicit private queue decouples delivery from the posting
-        // thread: even if NE marshals status changes onto the main queue, the
-        // block runs here (the plugin's main thread is the blocked loop
-        // thread, so main-queue delivery would otherwise never fire).
+        // An explicit private queue decouples delivery from the posting thread:
+        // the handler only signals the plugin, so it must never wait for the
+        // main queue to be free.
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         // Retained for the observer's lifetime: NotificationCenter does not

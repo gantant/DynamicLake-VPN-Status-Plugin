@@ -2,6 +2,10 @@
 
 All notable changes to the VPN Status plugin. The latest release is also summarized in the [README](README.md).
 
+## 1.4.1
+
+Audit fixes, mostly in the new state machine. A transparent proxy now resolves its exit country: the route guard read "no utun" as "not really connected", which skipped every lookup for proxy-only apps (X-VPN, Hotspot Shield) and left their connect peek held forever — and a held peek now demotes anyway, so a card can no longer stay stuck at notification priority. A probe refused because the previous connection's lookup was still in flight is retried instead of dropped, a failed `create` is no longer remembered as presented (which used to suppress every retry while the state held), and reconnecting clears the activity bookkeeping so the card is re-presented instead of assumed to be on screen. A failed initial NetworkExtension load retries twice, five seconds apart, rather than leaving provider names generic until restart. The socket writer's wait on a full buffer is cut from one second to 100 ms so a wedged host cannot stall the main queue that long. Dead code from the polling design is gone (`peekCountryRecheckSec`, an unused create wrapper), the timer window no longer re-arms on a host that rejected `timer`, and waking from sleep now actually re-resolves the exit country — dropping any lookup that was in flight — instead of only logging that it would. The flag already on screen stays put until a different country comes back.
+
 ## 1.4.0
 
 No polling and no subprocesses. The plugin used to spawn `scutil --nc list` (plus `--nc status` while connected) on every tick — about 43,000 launches a day on an idle machine — and `route -n get` for every routing question, up to four spawns per Proton probe. Both are gone, and so is the loop that drove them: the plugin is now a main-queue state machine that renders when a status source fires, when DynamicLake sends a frame, or when one of its own one-shot deadlines comes due, and otherwise sleeps in the run loop.

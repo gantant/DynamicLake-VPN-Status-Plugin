@@ -2,17 +2,22 @@ import Darwin
 import Foundation
 
 public let DynamicLakeMaxFrameSize = 64 * 1024
-public let DynamicLakeSendRetryDelayUs: UInt32 = 10_000
+/// `sendAll` runs on the plugin's main queue — the same thread that services
+/// NetworkExtension callbacks, socket and doorbell sources and every deadline —
+/// so a full socket buffer may only stall it briefly. 20 × 5 ms bounds the stall
+/// at 100 ms; past that the frame is reported as failed and the plugin's
+/// reconnect path takes over, instead of blocking status events for a second.
+public let DynamicLakeSendRetryDelayUs: UInt32 = 5_000
 /// Bounds how long `sendAll` waits on a full socket buffer before failing, so a
 /// wedged DynamicLake feeds the plugin's reconnect path instead of hanging it.
-public let DynamicLakeSendMaxRetries = 100
+public let DynamicLakeSendMaxRetries = 20
 
 /// User agent for every HTTPS lookup the plugin makes (exit country, Proton exit
 /// identity). One constant for all of them, kept in sync with the version in
 /// `plugin.json`; a per-file copy is how the Proton lookups once identified as
 /// 1.1.7 in a 1.3.x build. Lives here because this file is compiled into the
 /// plugin and into every test target that performs lookups.
-public let pluginUserAgent = "VPNStatus-DynamicLake/1.4.0"
+public let pluginUserAgent = "VPNStatus-DynamicLake/1.4.1"
 
 public enum DynamicLakeSocketError: Error, CustomStringConvertible {
     case socketPathMissing(String)
