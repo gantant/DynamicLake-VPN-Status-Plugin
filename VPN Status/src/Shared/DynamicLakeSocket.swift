@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 
 public let DynamicLakeMaxFrameSize = 64 * 1024
-public let DynamicLakePollIntervalUs: UInt32 = 50_000
 public let DynamicLakeSendRetryDelayUs: UInt32 = 10_000
 /// Bounds how long `sendAll` waits on a full socket buffer before failing, so a
 /// wedged DynamicLake feeds the plugin's reconnect path instead of hanging it.
@@ -10,10 +9,10 @@ public let DynamicLakeSendMaxRetries = 100
 
 /// User agent for every HTTPS lookup the plugin makes (exit country, Proton exit
 /// identity). One constant for all of them, kept in sync with the version in
-/// `plugin.json`; a per-file copy is how the Proton lookups ended up identifying
-/// as 1.1.7 in a 1.3.x build. Lives here because this file is compiled into the
+/// `plugin.json`; a per-file copy is how the Proton lookups once identified as
+/// 1.1.7 in a 1.3.x build. Lives here because this file is compiled into the
 /// plugin and into every test target that performs lookups.
-public let pluginUserAgent = "VPNStatus-DynamicLake/1.3.1"
+public let pluginUserAgent = "VPNStatus-DynamicLake/1.4.0"
 
 public enum DynamicLakeSocketError: Error, CustomStringConvertible {
     case socketPathMissing(String)
@@ -33,6 +32,9 @@ public final class JSONSocketClient {
     public let socketPath: String
     private var fileDescriptor: Int32 = -1
     private var readBuffer = Data()
+    /// Set when the host closes its end. The plugin cannot recover by reading
+    /// (there is nothing left to read) and reconnects instead.
+    public private(set) var isClosed = false
 
     public init(socketPath: String) {
         self.socketPath = socketPath
@@ -40,15 +42,27 @@ public final class JSONSocketClient {
 
     deinit { close() }
 
+    /// The socket's file descriptor, for a dispatch read source. -1 when
+    /// disconnected.
+    public var descriptor: Int32 { fileDescriptor }
+
     public func connect() throws {
+        // Never leak the previous descriptor, and never carry a partial frame
+        // from the old session into the new one.
+        close()
+        isClosed = false
+        readBuffer.removeAll()
+
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DynamicLakeSocketError.socket("socket failed") }
-        fileDescriptor = fd
 
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let maxPathLength = MemoryLayout.size(ofValue: address.sun_path)
-        guard socketPath.utf8.count < maxPathLength else { throw DynamicLakeSocketError.socket("socket path too long") }
+        guard socketPath.utf8.count < maxPathLength else {
+            Darwin.close(fd)
+            throw DynamicLakeSocketError.socket("socket path too long")
+        }
 
         socketPath.withCString { source in
             withUnsafeMutablePointer(to: &address.sun_path) { pointer in
@@ -64,7 +78,13 @@ public final class JSONSocketClient {
                 Darwin.connect(fd, sp, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard result == 0 else { throw DynamicLakeSocketError.socket("connect failed") }
+        guard result == 0 else {
+            // A throw used to leave this descriptor open for the life of the
+            // process; every failed reconnect leaked one.
+            Darwin.close(fd)
+            throw DynamicLakeSocketError.socket("connect failed")
+        }
+        fileDescriptor = fd
 
         let flags = Darwin.fcntl(fd, F_GETFL, 0)
         if flags >= 0 { _ = Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
@@ -86,6 +106,8 @@ public final class JSONSocketClient {
         try sendAll(frame)
     }
 
+    /// Every complete frame that has arrived, leaving a partial frame buffered.
+    /// Sets `isClosed` when the host has gone away.
     public func receiveAvailable() -> [[String: Any]] {
         guard fileDescriptor >= 0 else { return [] }
         var tmp = [UInt8](repeating: 0, count: 4096)
@@ -95,7 +117,11 @@ public final class JSONSocketClient {
                 Darwin.recv(fileDescriptor, p.baseAddress!, cap, 0)
             }
             if count > 0 { readBuffer.append(tmp, count: count); continue }
-            if count == 0 { break }
+            if count == 0 {
+                // Orderly shutdown: nothing more will ever arrive.
+                isClosed = true
+                break
+            }
             if errno == EAGAIN || errno == EWOULDBLOCK { break }
             break
         }
@@ -139,47 +165,45 @@ public final class JSONSocketClient {
     }
 }
 
-public func runProcess(_ path: String, arguments: [String], timeout: TimeInterval = 5, log: ((String) -> Void)? = nil) -> (Data, Int32) {
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: path)
-    proc.arguments = arguments
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    proc.standardOutput = outPipe
-    proc.standardError = errPipe
-    if let log = log {
-        log("run: \(path) \(arguments.joined(separator: " "))")
-    }
-    do {
-        try proc.run()
-    } catch {
-        return (Data(), -1)
-    }
-    // Close the child's pipe ends on every path past a successful spawn —
-    // including the timeout/kill path — so a throw-free run can never leak
-    // descriptors into the poll loop.
-    defer {
-        outPipe.fileHandleForReading.closeFile()
-        errPipe.fileHandleForReading.closeFile()
-    }
-    let deadline = Date().addingTimeInterval(timeout)
-    while proc.isRunning && Date() < deadline {
-        usleep(DynamicLakePollIntervalUs)
-    }
-    if proc.isRunning {
-        // Graceful stop first; escalate to SIGKILL so a hung child (or a hung
-        // readDataToEndOfFile on its pipes) can never stall the poll loop.
-        proc.terminate()
-        let killDeadline = Date().addingTimeInterval(0.5)
-        while proc.isRunning && Date() < killDeadline {
-            usleep(DynamicLakePollIntervalUs)
+/// A doorbell that wakes the plugin's main-queue work from any thread.
+///
+/// Status sources (NetworkExtension notifications, the path monitor, sleep and
+/// wake, resolver completions) all fire on their own queues. They cannot touch
+/// the plugin's state directly, and the plugin must not poll to notice them, so
+/// each one writes a byte here; a read source on the main queue wakes and
+/// re-renders. One byte is deliberate — the reader only needs "something
+/// changed", and a full pipe already means a wake is pending, so `signal` never
+/// blocks.
+public final class EventSignal {
+    public let descriptor: Int32
+    private let writeDescriptor: Int32
+
+    public init?() {
+        var descriptors: [Int32] = [-1, -1]
+        guard pipe(&descriptors) == 0 else { return nil }
+        descriptor = descriptors[0]
+        writeDescriptor = descriptors[1]
+        for fd in descriptors {
+            let flags = Darwin.fcntl(fd, F_GETFL, 0)
+            if flags >= 0 { _ = Darwin.fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
+            _ = Darwin.fcntl(fd, F_SETFD, FD_CLOEXEC)
         }
-        if proc.isRunning {
-            kill(proc.processIdentifier, SIGKILL)
-        }
-        proc.waitUntilExit()
     }
-    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-    _ = errPipe.fileHandleForReading.readDataToEndOfFile()
-    return (data, proc.terminationStatus)
+
+    deinit {
+        Darwin.close(descriptor)
+        Darwin.close(writeDescriptor)
+    }
+
+    /// Wakes the reader. Safe from any thread; never blocks.
+    public func signal() {
+        var byte: UInt8 = 1
+        _ = Darwin.write(writeDescriptor, &byte, 1)
+    }
+
+    /// Empties the pipe. Only the fact that it fired matters.
+    public func drain() {
+        var buffer = [UInt8](repeating: 0, count: 64)
+        while Darwin.read(descriptor, &buffer, buffer.count) > 0 {}
+    }
 }
