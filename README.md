@@ -26,7 +26,7 @@ Status is fully event-driven. Every transition arrives as a macOS NetworkExtensi
 
 ## Install
 
-Open `VPNStatus.dynamiclakeplugin.zip` with DynamicLake, or install locally: DynamicLake Playground → Settings → Plugins → Install Local → `VPNStatus.dynamiclakeplugin`.
+Open `VPNStatus.dynamiclakeplugin.zip` with DynamicLake.
 
 ```
 VPNStatus.dynamiclakeplugin/
