@@ -667,29 +667,74 @@ private func dismissPayload() -> [String: Any] {
     ]
 }
 
-/// Launch the installed provider app. Bundle identifiers rather than URL
-/// schemes: both apps expose several schemes, and LaunchServices resolves the
-/// bundle id wherever the app actually lives — /Applications, ~/Applications,
-/// a renamed copy like "NordVPN 2.app", or an App Store install. The same
-/// resolver decides whether the lake's logo is pressable, so a provider whose
-/// app is not installed never gets a dead control.
+/// Launch the app of the VPN the card names. Two ways to find it:
+///
+/// - A known bundle identifier (NordVPN, ProtonVPN) goes through LaunchServices,
+///   which resolves it wherever the app actually lives — /Applications,
+///   ~/Applications, a renamed copy like "NordVPN 2.app", or an App Store
+///   install.
+/// - Every other provider — Hotspot Shield, X-VPN, a vendor's own WireGuard
+///   build — is matched by name against the apps that are running, because there
+///   is no identifier to look up. The name comes from the live tunnel's own
+///   configuration, so the shield opens the VPN that is actually connected, not
+///   a brand that merely happens to be installed or running.
+///
+/// The same resolver decides whether the lake's logo is pressable, so a provider
+/// with no app to find never gets a dead control.
 private let providerBundleIdentifiers: [String: String] = [
     "ProtonVPN": "ch.protonvpn.mac",
     "NordVPN": "com.nordvpn.NordVPN"
 ]
 
 /// Successful lookups only; a miss is retried when the lake is next built, so
-/// installing the app while the plugin runs is picked up without a restart.
+/// installing (or launching) the app while the plugin runs is picked up without
+/// a restart.
 private var resolvedProviderApps: [String: URL] = [:]
 
 private func providerAppURL(_ provider: String?) -> URL? {
-    guard let provider = provider, let bundleID = providerBundleIdentifiers[provider] else { return nil }
+    guard let provider = provider, !provider.isEmpty else { return nil }
     if let cached = resolvedProviderApps[provider] { return cached }
-    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-        return nil
+    if let bundleID = providerBundleIdentifiers[provider],
+       let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+        resolvedProviderApps[provider] = url
+        return url
     }
+    guard let running = runningApp(matching: provider), let url = running.bundleURL else { return nil }
     resolvedProviderApps[provider] = url
     return url
+}
+
+/// The running app whose name matches a tunnel configuration's description.
+///
+/// Configuration names carry suffixes and punctuation the app name does not
+/// ("Hotspot Shield VPN (Hydra)", "X-VPN - System Proxy"), so both sides are
+/// reduced to lowercase letters and digits, parenthesised text is dropped, and
+/// one name must *start* the other ("hotspotshieldvpn" starts "hotspotshield").
+/// A prefix test rather than a substring test: with containment, a short app
+/// name could match in the middle of a long configuration name and open the
+/// wrong app. Four characters is the floor, so a fragment cannot claim anything,
+/// and a tunnel nothing can name (shown as "VPN") matches nothing.
+/// Background-only processes are skipped; a menu-bar VPN client is an
+/// `.accessory` app, so `.regular` alone would miss the very apps this is for.
+private func runningApp(matching provider: String) -> NSRunningApplication? {
+    let wanted = appMatchKey(provider)
+    guard wanted.count >= 4 else { return nil }
+    return NSWorkspace.shared.runningApplications.first { app in
+        guard app.activationPolicy != .prohibited else { return false }
+        let key = appMatchKey(app.localizedName ?? "")
+        return key.count >= 4 && (key.hasPrefix(wanted) || wanted.hasPrefix(key))
+    }
+}
+
+/// Lowercase letters and digits only, with any parenthesised suffix dropped.
+private func appMatchKey(_ name: String) -> String {
+    var text = name.lowercased()
+    if let parenthesis = text.firstIndex(of: "(") {
+        text = String(text[..<parenthesis])
+    }
+    return String(text.unicodeScalars
+        .filter { CharacterSet.alphanumerics.contains($0) }
+        .map(Character.init))
 }
 
 private func openProviderApp(provider: String?) {
