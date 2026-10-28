@@ -7,23 +7,16 @@ import Foundation
 // using the single-shot country resolver in VPNStatusPlugin.swift.
 //
 // Background: during a ProtonVPN reconnect / Quick Connect / server change,
-// `scutil` can already report Connected and a utun route can already exist
-// while the OLD Proton exit route is still carrying traffic. A single
-// country-only lookup run in that window returns the OLD exit country and the
-// main loop accepts it, because only the country code is tracked. The fix is
-// to resolve BOTH the public exit IP and the country, twice, and only accept
-// the country when the same exit IP is observed in both probes with a stable
-// utun route around them.
+// the tunnel can already report Connected while the OLD Proton exit route is
+// still carrying traffic. A single country-only lookup run in that window
+// returns the OLD exit country and the main loop accepts it, because only the
+// country code is tracked. The fix is to resolve BOTH the public exit IP and
+// the country, twice, and only accept the country when the same exit IP is
+// observed in both probes with a stable utun route around them.
 
 /// Gap between the two Proton exit probes. Short on purpose: stability comes
 /// from comparing two observations, not from waiting longer.
 let protonExitProbeGapSec: TimeInterval = 0.4
-/// Proton re-probes while connected on this cadence (NordVPN keeps using
-/// `countryRefreshIntervalSec`). Shorter because a Proton server switch does
-/// not necessarily change the service name, server address, or utun
-/// interface, so the public exit IP is part of the effective connection
-/// identity and must be re-checked to notice the switch.
-let protonExitRefreshIntervalSec: TimeInterval = 5
 
 /// True only for ProtonVPN. NordVPN (and every other provider, including nil)
 /// must keep the existing single-shot country behavior.
@@ -58,27 +51,22 @@ enum ProtonExitDisposition: Equatable {
     case unstableRetry
     /// The utun route vanished or moved mid-probes; wait for it to stabilize.
     case routeRetry
-    /// A newer generation started (reconnect / disconnect / server change was
-    /// detected elsewhere); this pair belongs to the past.
-    case staleDiscard
-    /// VPN is no longer connected; clear state, publish nothing.
-    case disconnectedDiscard
 }
 
 /// Decides what to do with two Proton exit probes. No networking, no logging,
 // no public-IP handling beyond string comparison (callers must never log IPs).
+///
+/// The generation tag and the connected flag are not verdicts here: the caller
+/// compares the result's generation against the live one when it takes the
+/// result, and a disconnected tunnel fails the route check below. Two cases
+/// used to exist for them, unreachable from the only caller.
 func evaluateProtonExit(
     first: ProtonExitProbe?,
     second: ProtonExitProbe?,
     routeBefore: String?,
     routeBetween: String?,
-    routeAfter: String?,
-    generation: UInt64,
-    currentGeneration: UInt64,
-    connected: Bool
+    routeAfter: String?
 ) -> ProtonExitDisposition {
-    guard connected else { return .disconnectedDiscard }
-    guard generation == currentGeneration else { return .staleDiscard }
     guard let before = routeBefore, !before.isEmpty,
           let between = routeBetween, !between.isEmpty,
           let after = routeAfter, !after.isEmpty,
@@ -92,44 +80,14 @@ func evaluateProtonExit(
     return .accept
 }
 
-// MARK: - Exit-IP route helpers (IPv4/IPv6 correctness)
+// MARK: - Exit-IP route checks
 //
-// The main loop validates `route -n get 1.1.1.1` (IPv4). URLSession, however,
-// may reach the lookup server over IPv6 while only IPv4 was validated. The
-// Proton path therefore additionally checks the route for the *observed exit
-// IP itself*, using `-inet6` for IPv6 literals, so a lookup that escaped over
-// another path is discarded instead of published.
-
-/// `route` arguments that reveal which interface carries traffic to `host`.
-/// Uses `-inet6` for IPv6 literals so the checked family matches the address.
-func routeArguments(forHost host: String) -> [String] {
-    if host.contains(":") {
-        return ["-n", "get", "-inet6", host]
-    }
-    return ["-n", "get", host]
-}
-
-/// Extracts the interface name from `route -n get` output, or nil when the
-/// output carries no interface line.
-func parseRouteInterface(from output: String) -> String? {
-    for line in output.components(separatedBy: "\n") {
-        let fields = line.split(whereSeparator: { $0.isWhitespace })
-        guard fields.count == 2, fields[0] == "interface:" else { continue }
-        return String(fields[1])
-    }
-    return nil
-}
-
-func routeInterfaceForHost(_ host: String, timeout: TimeInterval = 1) -> String? {
-    let (data, status) = runProcess("/sbin/route", arguments: routeArguments(forHost: host), timeout: timeout)
-    guard status == 0, let output = String(data: data, encoding: .utf8) else { return nil }
-    return parseRouteInterface(from: output)
-}
-
-func isTunnelInterface(_ name: String?) -> Bool {
-    guard let name else { return false }
-    return name.hasPrefix("utun")
-}
+// The main loop validates the default route (IPv4). URLSession, however, may
+// reach the lookup server over IPv6 while only IPv4 was validated, and the
+// observed exit IP may be either family. The Proton path therefore also asks
+// the kernel which interface carries traffic to the observed exit IP itself, so
+// a lookup that escaped over another path is discarded instead of published.
+// Both answers come from `RouteTable`, in process, family-correct.
 
 // MARK: - Exit-identity parsing (both IP and country, never just country)
 
@@ -204,7 +162,8 @@ func shouldHoldPeekForCountry(connected: Bool, countryCode: String) -> Bool {
 // request performs TWO exit-identity fetches separated by
 // `protonExitProbeGapSec`, with a utun route check before, between, and
 // after. Only a stable pair is published; anything else completes as an
-// empty-country result so the main loop retries on its normal cadence.
+// empty-country result so the main loop retries a bounded number of times (and
+// stops retrying once it has a country).
 // Results are tagged with the requesting generation; the main loop additionally
 // requires `result.generation == currentGeneration` before accepting.
 
@@ -218,18 +177,22 @@ final class ProtonExitResolver {
     private let ipv4RouteCheck: () -> String?
     private let hostRouteCheck: (String) -> String?
     private let logger: (String) -> Void
-    /// Routine per-probe lines (`probe started`, `exit stable country=`) fire
-    /// on every 5s re-probe while connected and would grow the log without
-    /// bound, so production leaves this off; anomaly lines (route mismatch,
-    /// unstable pair, stale discards) always log. Tests opt in to assert on
-    /// the routine lines.
+    /// Fires on the resolver's queue whenever a lookup finishes, so the plugin
+    /// can apply the result without polling `takeResult`. The plugin renders on
+    /// the main queue, so the handler only has to wake it.
+    var onResult: (() -> Void)?
+    /// Routine per-probe lines (`probe started`, `exit stable country=`) fire on
+    /// every probe the plugin asks for and would grow the log without much value,
+    /// so production leaves this off; anomaly lines (route mismatch, unstable
+    /// pair, stale discards) always log. Tests opt in to assert on the routine
+    /// lines.
     private let logsRoutineDiagnostics: Bool
 
     init(
         probeGap: TimeInterval = protonExitProbeGapSec,
         session: URLSession = URLSession(configuration: .ephemeral),
-        ipv4RouteCheck: @escaping () -> String? = ProtonExitResolver.defaultIPv4Route,
-        hostRouteCheck: @escaping (String) -> String? = { routeInterfaceForHost($0) },
+        ipv4RouteCheck: @escaping () -> String? = { RouteTable.tunnelInterfaceName() },
+        hostRouteCheck: @escaping (String) -> String? = { RouteTable.interfaceName(for: $0) },
         logger: @escaping (String) -> Void = { _ in },
         logsRoutineDiagnostics: Bool = false
     ) {
@@ -245,13 +208,6 @@ final class ProtonExitResolver {
     private func routineLog(_ message: String) {
         guard logsRoutineDiagnostics else { return }
         logger(message)
-    }
-
-    static func defaultIPv4Route() -> String? {
-        let (data, status) = runProcess("/sbin/route", arguments: ["-n", "get", "1.1.1.1"], timeout: 1)
-        guard status == 0, let output = String(data: data, encoding: .utf8) else { return nil }
-        let name = parseRouteInterface(from: output)
-        return isTunnelInterface(name) ? name : nil
     }
 
     /// Starts a stabilized two-probe lookup. Returns false when one is already
@@ -322,17 +278,14 @@ final class ProtonExitResolver {
         // `result.generation == currentGeneration` on take (stale pairs are
         // logged and discarded there). Here, filter route stability and
         // probe agreement only. Route checks already fail when the tunnel is
-        // gone, so a disconnect mid-flight ends in `routeRetry` and its
-        // tagged result is then discarded as stale.
+        // gone, so a disconnect mid-flight ends in `routeRetry` and its tagged
+        // result is then discarded as stale.
         let verdict = evaluateProtonExit(
             first: first,
             second: second,
             routeBefore: routeBefore,
             routeBetween: routeBetween,
-            routeAfter: routeAfter,
-            generation: generation,
-            currentGeneration: generation,
-            connected: true
+            routeAfter: routeAfter
         )
         switch verdict {
         case .accept:
@@ -341,7 +294,7 @@ final class ProtonExitResolver {
             // itself route through a utun interface, guarding against a lookup
             // that escaped over another path (e.g. IPv6 vs IPv4 mismatch).
             // NOTE: never log the IP itself.
-            if !isTunnelInterface(hostRouteCheck(probe.ip)) {
+            if !RouteTable.isTunnel(hostRouteCheck(probe.ip)) {
                 logger("proton exit route mismatch; discarded")
                 finish(nil, generation: generation)
                 return
@@ -362,11 +315,6 @@ final class ProtonExitResolver {
         case .routeRetry:
             logger("proton route changed during lookup; discarded")
             finish(nil, generation: generation)
-        case .staleDiscard:
-            logger("stale exit lookup discarded generation=\(generation)")
-            finish(nil, generation: generation)
-        case .disconnectedDiscard:
-            finish(nil, generation: generation)
         }
     }
 
@@ -375,6 +323,9 @@ final class ProtonExitResolver {
         pending = result ?? ProtonExitIdentity(ip: "", countryCode: "", countryName: "", generation: generation)
         inFlight = false
         lock.unlock()
+        // Wakes the plugin so the result is applied immediately; without this
+        // the plugin would have to poll to notice it.
+        onResult?()
     }
 
     /// Fetches one (IP + country) exit observation, preferring the Mullvad

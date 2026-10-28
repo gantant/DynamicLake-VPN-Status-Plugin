@@ -2,25 +2,60 @@
 
 All notable changes to the VPN Status plugin. The latest release is also summarized in the [README](README.md).
 
+## 1.4.1
+
+Audit fixes in the new state machine:
+
+- Proxy-only VPNs resolve an exit country again — the route guard read "no utun" as "not really connected" and skipped every lookup for them — and a held peek now demotes, so a card cannot stay stuck at notification priority.
+- A probe refused because the previous connection's lookup was still in flight is retried instead of dropped, and a failed `create` is no longer recorded as presented, which used to suppress every retry.
+- Reconnecting clears the activity bookkeeping, so the card is re-presented instead of assumed to be on screen; a failed NetworkExtension load retries twice, five seconds apart.
+- The socket writer's stall on a full buffer is capped at 100 ms instead of a second. Dead code from the polling era is gone, and waking from sleep re-resolves the country instead of only logging that it would.
+
+## 1.4.0
+
+No polling and no subprocesses. `scutil --nc list`/`--nc status` (about 43,000 launches a day on an idle machine) and every `route -n get` are gone. The plugin is a main-queue state machine that renders when a status source fires, when a frame arrives, or when one of its own one-shot deadlines comes due, and sleeps in the run loop otherwise.
+
+- **Status:** `NEVPNStatusDidChange`, with the routing table read in process behind it — a UDP socket's source address (`getsockname` + `getifaddrs`, ~30 µs) or, for a tunnel carrying no address, the kernel's default routes via `sysctl(NET_RT_DUMP)`, with scoped per-interface defaults filtered out. Enumeration at load is asynchronous, so the first card comes from the routing table and is repainted when NetworkExtension answers.
+- **Timers:** connect confirmation, peek, demote, notification dismissal, the six-attempt country retry and the timer window roll are one-shot deadlines. Measured idle cost: 0.02 s of CPU over 10 s.
+- **Naming:** a tunnel with an NE configuration is named by it, including providers this plugin does not map; one without is **VPN**; a disconnected card names only a session it actually saw.
+- **Hardening:** one instance per socket (`flock`), both slices ad-hoc signed after `lipo`, the log created `0600` with host error text flattened so it cannot forge entries, and a rejected `response` now triggers the timer fallback too.
+- **Country names** are capped — 14 characters on the lake, 10 in the glance — with short forms and an ISO-code fallback, so `Connected · UAE` no longer runs off the end of the line.
+
+## 1.3.6
+
+The session timer is DynamicLake's own `timer` component instead of text the plugin rendered and patched once a second. The host ticks it, so it is no longer clipped as `Connected · Romania · 5:07` outgrew its line, and the card costs no per-second traffic at all. `timer` needs an `endDate` and stops counting there, so the card arms a 24-hour window and re-sends it hours before that ends: one lake command per window roll, never a poll.
+
+The card is filled out around it. The timer sits above the exit-country flag in a trailing column, where no text can squeeze it; the logo and flag are larger (34 and 32 points); and the row's clearance is recentred for the taller row (14 points instead of 20). Text styles are unchanged — `compact`, `plain` and `large` are all DynamicLake offers, the name already used the largest, and `large` on the state line would truncate long country names at the card's width. The glance shows the lake's own state line, which now has no clock on either surface.
+
+A host build whose validator does not know `timer` rejects the whole lake command, so the first such rejection drops the timer for the rest of the process and repaints the card without it.
+
+## 1.3.5
+
+The row sits in the card instead of on its top edge. With `hideHeader` the content starts at the top of a 390 × 80 notification card while the row is about 38 points, so it read top heavy with a dead band under it; a fixed 20-point spacer drops it into place, and a `spacer` with no `length` renders nothing, so the position is a real point value.
+
+DynaGlance is redesigned as the header row DynamicLake already sizes for that area — logo in `leftSlot`, provider in `title`, the state line in `subtitle`, flag in `rightSlot` — instead of a hidden header with a hand-built row of 24-point artwork and `compact` text, which filled a fraction of the space. The glance's line drops the session clock, which `Connected · Romania · 5:07` is too long for: it was clipped there, so the clock stays on the lake.
+
+## 1.3.4
+
+VPNs that install their own tunnel (X-VPN, Hotspot Shield, the WireGuard app) are detected again — the fallback had been compiled out of release builds behind a debug flag, and it asked the NWPathMonitor mirror, which keeps reporting nil after a client-installed utun takes the default route. The interface carrying traffic is now resolved in-process: a UDP socket connected to 1.1.1.1 sends nothing, but the kernel resolves the route and binds a source address, which maps to its interface with `getifaddrs` — ~60 µs a call, no subprocess, no timer. Unnamed routed tunnels read as **VPN** (the old process-name guess labelled a Hotspot Shield tunnel as X-VPN), and the disconnected card names the provider that was actually connected rather than whichever configured tunnel exists.
+
+Proxy-only VPNs are detected too: apps that install no tunnel route through a NetworkExtension **transparent proxy**, and `NETransparentProxyManager` is an `NEVPNManager` subclass, so their status arrives through the same `NEVPNStatusDidChange` events. A proxy belonging to a tunnel provider (Proton's split tunnelling) is suppressed rather than reported as a connection.
+
+## 1.3.3
+
+Hardening only. `size` is limited to image slots, settings are re-parsed only when they change, Proton's user agent follows the plugin's, the log path is overridable so tests stay out of `~/Library/Logs`, and a test pins the version string to the manifest.
+
+## 1.3.2
+
+Tapping the logo opens the provider app through an image `actionID`. Builds that reject the field (`Unknown field 'actionID'`) get the right-click menu instead, after one automatic repaint.
+
 ## 1.3.1
 
-ProtonVPN connections now get their country flag. The stabilized Proton exit lookup 一 which only publishes a country when the utun route holds still across three checks and two probes agree 一 could discard every pair on a network where the route table keeps moving or the lookup endpoint answers only some of the time, so the card sat at `Connected` with no country (and no flag) for the whole session; the log showed `proton exit unstable; retrying` and `proton route changed during lookup; discarded` on repeat. After three consecutive discarded pairs the connection now logs `falling back to single-shot country lookup` and hands over to the plain lookup NordVPN already uses, so the flag appears and keeps refreshing. The stabilized path is still tried first on every new connection, so a clean session keeps its strict server-switch detection; both counters reset when the connection changes.
-
-The lake is notification sized and has no button row. `plugin.json` now declares `"lake": { "size": "notification" }` — DynamicLake's 390 × 80 notification card — instead of the small 390 × 110 one, and the **Open** button is gone from the card. What is left is a single row, which is the shape a notification lake is built for: the provider logo, the provider name over one line of state, and the exit-country flag at the trailing edge.
-
-**Right-clicking the logo** opens the provider app. Three attempts at a left-click target all failed in a visible way: a `plain` button with no symbol renders an opaque disc (the obstructive circle that sat on the artwork), giving it a symbol draws the symbol, and a zero-width title does not suppress the disc — the label is simply ignored for that shape. Stacking the button behind the artwork hid it but also stopped it receiving the press, since the image on top takes the hit. Every component can carry a `contextMenu`, and that draws nothing until opened, so the action moved there: right-clicking the provider mark offers `Open <provider>` and sends the same `actionID: "open-app"` action with `surface: "lake"`. The card therefore draws no control at all. The menu entry only exists when LaunchServices can resolve that provider's bundle identifier (relocated, renamed and App Store installs included), so a provider whose app is missing gets no dead entry, and the press resolves against the provider the visible card was built for, not the latest poll.
-
-The **session clock moved into the status line** — `Connected · Romania · 5:07`, formatted by the plugin as before, still omitted when no exact start date is known — so the trailing column holds only the flag. That let the **flag grow to 30 points** (it was 22) and stop being a two-row stack. The per-second `lakePatch` now patches that whole status line under one id instead of a clock component, so the frame is the same few dozen bytes; it resends `style` and `tint` with the text, because a patch replaces the whole component and a bare text patch turned the gray secondary line primary white a second after the card opened.
-
-Both cards were then clipped by the notch. Removing the clock from the trailing column shortened the row, which pulled the name up with it, so the card now carries a **1-point clearance spacer** above the row in both states — a lake's `padding` takes no top edge, so a fixed spacer is the only downward control; the body stack's spacing is now 0 so that spacer is the exact gap, where the old 10-point spacing had inflated a 1-point spacer to about 11 — and the disconnected card keeps its flush bottom instead of the connected card's 6-point lift. Nothing else changes: the live activity, sneak peeks, flags, clock ticking and DynaGlance design are untouched, and the `lakeOpened` refresh behaves as before. The lake size lives in the manifest, so DynamicLake picks it up on reinstall, not on a restart.
+Notification-sized lake (390 × 80) with no button row, the session clock folded into the status line, a 30-point flag, and a 1-point spacer so the notch stops clipping the name. Reinstalling is required for the manifest size change.
 
 ## 1.3.0
 
-Built for the new DynamicLake plugin API, keeping full backward compatibility. The plugin now declares a lake — a single small status card. DynamicLake's built-in header row is hidden and the card is laid out by hand: provider logo, the provider name in the card's larger text style over `Connected · <country>` (or `Not connected`), a trailing column with the exit-country flag and the session clock underneath it, and, as its own row across the bottom of the card, the **Open** button that launches the installed ProtonVPN or NordVPN app — labelled with the provider and given the full card width, so its label is never squeezed. The clock is rendered by the plugin rather than by DynamicLake's `timer` component (which cannot drop the leading hour): it reads `5:07` under an hour and `1:02:03` past it, is patched once per second only while the lake is visible, and is omitted entirely when no exact start is known — the scutil fallback (e.g. the WireGuard app) shows no estimate. DynamicLake frames are drained during the plugin's idle wait, and the last card is resent the moment `lakeOpened` is read, so opening the lake redraws it in milliseconds even while a status resolution is still running. The card body is lifted off the bottom edge with a bottom padding inset. Component padding accepts only `leading`, `bottom` and `trailing`: an unknown field there (a `top` inset) rejects the whole lake command and leaves DynamicLake showing its fallback card with just the plugin icon and title, so the padding keys are pinned by the runtime test. A socket that has refused every write for a minute now exits the plugin instead of reconnecting forever, so quitting or reinstalling DynamicLake no longer leaves stale plugin processes competing for the same socket (which could clear each other's registered images and blank the flag). The Open button only appears when the provider's app is installed; LaunchServices resolves the bundle identifier, so relocated, renamed and App Store installs work, and the press is resolved against the provider the visible card was built for. The lake also carries its own compact design for DynaGlance, whose pill button is temporary and appears only while the plugin has a live activity.
-
-Artwork uses the new image-asset path for the provider logo: it is registered once per connection with the `asset` command and referenced by id from the lake, compact activity, extra live activity and sneak peek, instead of re-sending the same base64 PNG on every update. The country flag stays inline — a 64×64 PNG of about 2 KB — because the lake's header slot rendered nothing for an asset reference, which left the card without its flag. The protocol handles `lakeOpened` (which also refreshes the visible card) and lake button `action` frames, and the plugin declares the lake in `plugin.json` so DynamicLake lists it under Plugins in the Left Click Lake, Right Click Lake and On Hover Behavior menus.
-
-Every new surface is feature-gated. A DynamicLake build that advertises none of `lake`, `lakeLayout` or `imageAssets` receives no lake or asset frames and the plugin behaves exactly as it did in 1.2.1; the manifest keys stay because a manifest cannot be conditional.
+Built for the new DynamicLake plugin API, with full backward compatibility. The lake is a hand-laid single card: provider logo, name over `Connected · <country>`, the exit-country flag with a session clock beneath it, and an **Open** button across the bottom. The clock is plugin-rendered (DynamicLake's `timer` cannot drop the leading hour), patched once a second only while the lake is visible, and omitted when no exact start date is known — the scutil path shows no estimate. Padding accepts only `leading`, `bottom` and `trailing`; a `top` inset rejects the whole lake command. The provider logo is registered once as an image asset (the flag stays inline), and every surface is feature-gated, so a build without `lake`, `lakeLayout` or `imageAssets` behaves exactly as 1.2.1.
 
 ## 1.2.1
 

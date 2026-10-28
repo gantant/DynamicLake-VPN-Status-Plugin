@@ -4,7 +4,7 @@ import Foundation
 // NordVPN behavior must remain the single-shot country path: these tests pin
 // that only Proton providers take the stabilization path, and that the
 // stabilizer only accepts a country when the same exit IP is observed twice
-// under a stable utun route and current generation.
+// under a stable utun route; the generation tag is compared by the caller.
 //
 // Build & run via tests/run.sh (no network access; all I/O is stubbed).
 
@@ -42,11 +42,8 @@ private enum ProtonExitTests {
         testPeekWaitsForCountry()
         testStableConnectionAccepted()
         testServerChangeRequiresRetry()
-        testStaleGenerationDiscarded()
         testRouteTransitionDiscarded()
-        testDisconnectDiscarded()
         testParsing()
-        testRouteHelpers()
         testResolverStablePublishes()
         testResolverUnstableRetries()
         testResolverRouteChangeRetries()
@@ -94,8 +91,7 @@ private enum ProtonExitTests {
         let verdict = evaluateProtonExit(
             first: probe("185.1.2.3", "CH", "Switzerland"),
             second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7"
         )
         check(verdict == .accept, "stable proton exit accepted")
     }
@@ -105,8 +101,7 @@ private enum ProtonExitTests {
         let changing = evaluateProtonExit(
             first: probe("185.1.2.3", "CH", "Switzerland"),
             second: probe("146.4.5.6", "DE", "Germany"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7"
         )
         check(changing == .unstableRetry, "changing proton exit not accepted yet")
         check(changing != .accept, "changing proton exit is not accept")
@@ -115,8 +110,7 @@ private enum ProtonExitTests {
         let splitCountry = evaluateProtonExit(
             first: probe("146.4.5.6", "CH", "Switzerland"),
             second: probe("146.4.5.6", "DE", "Germany"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7"
         )
         check(splitCountry == .unstableRetry, "same ip with split country retries")
 
@@ -124,46 +118,30 @@ private enum ProtonExitTests {
         let settled = evaluateProtonExit(
             first: probe("146.4.5.6", "DE", "Germany"),
             second: probe("146.4.5.6", "DE", "Germany"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7"
         )
         check(settled == .accept, "settled new proton exit accepted")
-    }
-
-    static func testStaleGenerationDiscarded() {
-        // Generation N lookup completes after generation N+1 started.
-        let verdict = evaluateProtonExit(
-            first: probe("185.1.2.3", "CH", "Switzerland"),
-            second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 11, currentGeneration: 12, connected: true
-        )
-        check(verdict == .staleDiscard, "stale generation discarded")
-        check(verdict != .accept, "stale generation never accepted")
     }
 
     static func testRouteTransitionDiscarded() {
         let gone = evaluateProtonExit(
             first: probe("185.1.2.3", "CH", "Switzerland"),
             second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: nil, routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: nil, routeAfter: "utun7"
         )
         check(gone == .routeRetry, "vanished route discarded")
 
         let moved = evaluateProtonExit(
             first: probe("185.1.2.3", "CH", "Switzerland"),
             second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: "utun8", routeAfter: "utun8",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun8", routeAfter: "utun8"
         )
         check(moved == .routeRetry, "moved route discarded")
 
         let nonTunnel = evaluateProtonExit(
             first: probe("185.1.2.3", "CH", "Switzerland"),
             second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "en0", routeBetween: "en0", routeAfter: "en0",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "en0", routeBetween: "en0", routeAfter: "en0"
         )
         // en0 is stable across probes, so the pure route check passes; the
         // resolver additionally requires a utun interface and drops this.
@@ -175,21 +153,9 @@ private enum ProtonExitTests {
         let missingProbe = evaluateProtonExit(
             first: nil,
             second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: true
+            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7"
         )
         check(missingProbe == .unstableRetry, "failed probe retries")
-    }
-
-    static func testDisconnectDiscarded() {
-        let verdict = evaluateProtonExit(
-            first: probe("185.1.2.3", "CH", "Switzerland"),
-            second: probe("185.1.2.3", "CH", "Switzerland"),
-            routeBefore: "utun7", routeBetween: "utun7", routeAfter: "utun7",
-            generation: 12, currentGeneration: 12, connected: false
-        )
-        check(verdict == .disconnectedDiscard, "disconnect discards exit probes")
-        check(verdict != .accept, "disconnect never accepted")
     }
 
     // MARK: - Parsing (IP + country together, never country-only)
@@ -235,23 +201,6 @@ private enum ProtonExitTests {
     }
 
     // MARK: - Route helpers (IPv4/IPv6 correctness)
-
-    static func testRouteHelpers() {
-        let sample = """
-        route to: 1.1.1.1
-        destination: default
-        interface: utun7
-        flags: <UP,GATEWAY,DONE,GLOBAL>
-        """
-        check(parseRouteInterface(from: sample) == "utun7", "route interface parsed")
-        check(parseRouteInterface(from: "no interface here\n") == nil, "missing interface is nil")
-        check(isTunnelInterface("utun7"), "utun is tunnel")
-        check(!isTunnelInterface("en0"), "en0 is not tunnel")
-        check(!isTunnelInterface(nil), "nil is not tunnel")
-        // The checked family must match the observed exit IP family.
-        check(routeArguments(forHost: "146.4.5.6") == ["-n", "get", "146.4.5.6"], "ipv4 route args")
-        check(routeArguments(forHost: "2a00:1::1") == ["-n", "get", "-inet6", "2a00:1::1"], "ipv6 route args")
-    }
 
     // MARK: - Resolver integration (stubbed I/O)
 

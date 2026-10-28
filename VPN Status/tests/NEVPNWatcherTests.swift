@@ -25,6 +25,7 @@ struct NEVPNWatcherTests {
 
     static func main() {
         testProviderAttribution()
+        testProxyAttribution()
         testStatusMapping()
         testHealthGating()
         finish()
@@ -46,6 +47,25 @@ struct NEVPNWatcherTests {
         expect(NEVPNWatcher.providerName(forDisplayName: nil) == nil, "nil name maps to nil")
     }
 
+    // MARK: - Proxy-only VPN attribution
+
+    // A transparent proxy is the whole VPN for an app that has no tunnel
+    // (X-VPN), but only an auxiliary path for a tunnel provider (Proton's split
+    // tunnelling): reporting the latter as a ProtonVPN connection would claim
+    // the tunnel is up when it isn't.
+    static func testProxyAttribution() {
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "X-VPN") == "X-VPN", "proxy-only app is its own provider")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "X-VPN - System Proxy") == "X-VPN", "vendor suffix is dropped")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "  X-VPN  ") == "X-VPN", "surrounding whitespace is trimmed")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "Proton VPN Split tunneling") == nil, "a tunnel provider's proxy is never a connection")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "ProtonVPN") == nil, "proton proxy name is suppressed")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "NordVPN - System Proxy") == nil, "nord proxy name is suppressed")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "") == nil, "empty proxy name is nil")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: "   ") == nil, "blank proxy name is nil")
+        expect(NEVPNWatcher.proxyProviderName(forDisplayName: nil) == nil, "nil proxy name is nil")
+        expect(NEVPNWatcher.proxyStatus() == nil, "no proxy configs -> nil, never fabricated")
+    }
+
     // MARK: - Status mapping
 
     struct FakeManager {
@@ -61,23 +81,25 @@ struct NEVPNWatcherTests {
         expect(NEVPNWatcher.Status(provider: "NordVPN", connected: false, connecting: true, serverAddress: nil, serviceName: nil).connecting == true, "connecting flag survives the struct")
         expect(NEVPNWatcher.Status(provider: "NordVPN", connected: true, connecting: false, serverAddress: "10.8.0.1", serviceName: "NordVPN - NordWhisper").serverAddress == "10.8.0.1", "server address is carried through")
         expect(NEVPNWatcher.Status(provider: "NordVPN", connected: true, connecting: false, serverAddress: nil, serviceName: nil, startDate: Date(timeIntervalSince1970: 1_726_800_000)).startDate != nil, "session start date is carried through")
+        expect(NEVPNWatcher.Status(provider: "NordVPN", connected: true, connecting: false, serverAddress: nil, serviceName: nil).isProxy == false, "tunnel status is not flagged as a proxy")
+        expect(NEVPNWatcher.Status(provider: "X-VPN", connected: true, connecting: false, serverAddress: nil, serviceName: "X-VPN", isProxy: true).isProxy, "proxy status keeps its flag")
     }
 
     // MARK: - Health gating contract
 
-    // Healthy by default, and markUnhealthy() must suppress answers until the
-    // epoch expires (the plugin relies on this to hand control to scutil).
+    // markUnhealthy() must suppress answers until the epoch expires: the plugin
+    // then reports what the routing table says instead of a stale NE claim.
     static func testHealthGating() {
-        expect(NEVPNWatcher.isHealthy(), "watcher starts healthy")
         NEVPNWatcher.markUnhealthy(seconds: 60)
-        expect(!NEVPNWatcher.isHealthy(), "markUnhealthy suppresses answers")
-        expect(NEVPNWatcher.bestStatus(target: .nord) == nil, "bestStatus returns nil while unhealthy")
-        NEVPNWatcher.markUnhealthy(seconds: 0)
-        expect(NEVPNWatcher.isHealthy(), "expired epoch heals")
+        expect(NEVPNWatcher.bestStatus(target: .nord) == nil, "markUnhealthy suppresses tunnel answers")
+        expect(NEVPNWatcher.anyStatus() == nil, "markUnhealthy suppresses any-tunnel answers")
+        expect(NEVPNWatcher.proxyStatus() == nil, "markUnhealthy suppresses proxy answers")
 
-        // bestStatus with no tunnels loaded must be nil even when healthy
-        // (never fabricate a state that would bypass the scutil fallback).
+        // Nothing is loaded in a test binary, so every reader answers nil rather
+        // than fabricating state; the routing table is the plugin's fallback.
+        NEVPNWatcher.markUnhealthy(seconds: 0)
         expect(NEVPNWatcher.bestStatus(target: .nord) == nil, "no tunnels loaded -> nil, never fabricated state")
+        expect(NEVPNWatcher.anyStatus() == nil, "no tunnels loaded -> no name invented")
     }
 
     static func finish() {

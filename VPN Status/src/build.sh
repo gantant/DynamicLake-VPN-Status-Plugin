@@ -10,7 +10,7 @@ ZIP="../VPNStatus.dynamiclakeplugin.zip"
 SLICE_DIR=$(mktemp -d)
 trap 'rm -rf "$SLICE_DIR"' EXIT
 
-SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift ProtonExit.swift NordServerLocation.swift NEVPNWatcher.swift PathWatcher.swift VPNStatusPlugin.swift)
+SOURCES=(Shared/DynamicLakeSocket.swift VPNStatusIcons.swift CountryFlagAsset.swift CountryLabel.swift RouteTable.swift ProtonExit.swift NordServerLocation.swift NEVPNWatcher.swift PathWatcher.swift VPNStatusPlugin.swift)
 NE_FLAGS=(-framework NetworkExtension -framework Network -framework AppKit)
 
 echo "==> Compiling arm64 slice"
@@ -25,6 +25,16 @@ echo "==> Merging universal binary (lipo)"
 lipo -create -output "$SLICE_DIR/vpn-status" \
     "$SLICE_DIR/vpn-arm64" "$SLICE_DIR/vpn-x86_64"
 lipo -info "$SLICE_DIR/vpn-status"
+
+# lipo keeps whatever signature each slice arrived with, and `ld` only
+# ad-hoc-signs the arm64 slice — the Intel half went into the package unsigned,
+# which fails validation on an Intel Mac or a quarantined download. Sign the fat
+# file ad hoc (one identity for both halves) and prove both slices verify.
+echo "==> Signing the universal binary (ad-hoc, both slices)"
+codesign --force --sign - --identifier com.nebulark.vpn-status "$SLICE_DIR/vpn-status"
+codesign --verify --strict --arch arm64 "$SLICE_DIR/vpn-status"
+codesign --verify --strict --arch x86_64 "$SLICE_DIR/vpn-status"
+echo "    both slices verify"
 
 echo "==> Assembling $PKG (fresh folder, current timestamp)"
 rm -rf "$PKG.old"
